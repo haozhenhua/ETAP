@@ -91,12 +91,33 @@ struct etap_schema {
     uint32_t epoch;
 };
 
+typedef struct {
+    uint16_t section_kind;
+    uint32_t col_id;
+    etap_type type;
+    uint32_t n;
+    uint8_t *data;      /* native-width array or varlen heap (owned or alias) */
+    uint8_t *valid;     /* may alias the raw buffer */
+    uint32_t *offsets;  /* varlen; may alias the raw buffer */
+    int owned;          /* data/valid/offsets allocated by the cache */
+} col_cache_ent;
+
 struct etap_batch {
     struct etap_sub *sub;
     int slot_index;
     uint8_t *buf;
     uint32_t size;
     struct etap_schema schema;
+    etap_batch_hdr hdr; /* decoded; always includes gap fields */
+    int hdr_ok;
+    col_cache_ent *cache;
+    uint32_t n_cache, cap_cache;
+    etap_parse_index_row *parse_rows;
+    uint32_t n_parse_rows;
+    int parse_ready;
+    etap_flow_meta_row *flow_rows;
+    uint32_t n_flow_rows;
+    int flow_ready;
 };
 
 struct etap_conn {
@@ -177,7 +198,7 @@ static const cat_field k_features[] = {
     { ETAP_FEAT_DURATION,  0, ETAP_T_DUR_NS, 0, "duration_ns" },
 };
 
-static uint32_t align8(uint32_t x) { return (x + 7u) & ~7u; }
+static uint32_t align4(uint32_t x) { return (x + 3u) & ~3u; }
 
 static uint32_t fnv1a(uint32_t h, const void *p, size_t n)
 {
@@ -727,15 +748,14 @@ static int wb_res(wbuf *w, uint32_t n)
     return -1;
 }
 
-static void wb_pad8(wbuf *w)
+static void wb_pad4(wbuf *w)
 {
-    uint32_t a = align8(w->len);
+    uint32_t a = align4(w->len);
     if (a > w->len && a <= w->cap) {
         memset(w->p + w->len, 0, a - w->len);
         w->len = a;
     }
 }
-
 
 static uint8_t has_field(const parse_sel *ps, uint32_t id)
 {
@@ -758,7 +778,358 @@ static uint8_t has_meta(const packet_sel *ps, uint32_t bit)
     return (ps->meta_mask & bit) != 0;
 }
 
-/* Column group: n_cols u16, flags u16, n_rows u32, then 16-byte descriptors, then data. */
+static uint32_t type_width(uint8_t t)
+{
+    switch (t) {
+    case ETAP_T_U8: case ETAP_T_I8: case ETAP_T_BOOL: return 1;
+    case ETAP_T_U16: case ETAP_T_I16: return 2;
+    case ETAP_T_U32: case ETAP_T_I32: case ETAP_T_F32:
+    case ETAP_T_IPV4: case ETAP_T_ENUM: return 4;
+    case ETAP_T_U64: case ETAP_T_I64: case ETAP_T_F64:
+    case ETAP_T_TS_NS: case ETAP_T_DUR_NS: return 8;
+    case ETAP_T_MAC: return 6;
+    case ETAP_T_IPV6: return 16;
+    default: return 0;
+    }
+}
+
+static int is_int_like(uint8_t t)
+{
+    switch (t) {
+    case ETAP_T_U8: case ETAP_T_U16: case ETAP_T_U32: case ETAP_T_U64:
+    case ETAP_T_I8: case ETAP_T_I16: case ETAP_T_I32: case ETAP_T_I64:
+    case ETAP_T_BOOL: case ETAP_T_ENUM: case ETAP_T_IPV4:
+    case ETAP_T_TS_NS: case ETAP_T_DUR_NS:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int is_signed_type(uint8_t t)
+{
+    return t == ETAP_T_I8 || t == ETAP_T_I16 || t == ETAP_T_I32 || t == ETAP_T_I64;
+}
+
+static int try_delta_type(uint8_t typ)
+{
+    return typ == ETAP_T_U64 || typ == ETAP_T_TS_NS || typ == ETAP_T_DUR_NS || typ == ETAP_T_U32;
+}
+
+static uint8_t bits_for(uint32_t maxv)
+{
+    uint8_t b = 0;
+    do {
+        b++;
+        maxv >>= 1;
+    } while (maxv);
+    return b;
+}
+
+static uint32_t packed_words(uint32_t n, uint8_t bw)
+{
+    return (n * (uint32_t)bw + 31u) / 32u;
+}
+
+static uint64_t load_u(const uint8_t *row, uint32_t width)
+{
+    uint64_t v = 0;
+    memcpy(&v, row, width);
+    return v;
+}
+
+static int64_t load_s(const uint8_t *row, uint32_t width)
+{
+    uint64_t u = load_u(row, width);
+    if (width < 8 && (u & (1ull << (8u * width - 1u))))
+        u |= ~((1ull << (8u * width)) - 1ull);
+    return (int64_t)u;
+}
+
+static void store_u(uint8_t *row, uint32_t width, uint64_t v)
+{
+    memcpy(row, &v, width);
+}
+
+static uint64_t zigzag64(int64_t d)
+{
+    return ((uint64_t)d << 1) ^ (uint64_t)(d >> 63);
+}
+
+static int64_t unzigzag64(uint64_t z)
+{
+    return (int64_t)((z >> 1) ^ (uint64_t)-(int64_t)(z & 1));
+}
+
+static void pack_u32_bits(uint8_t *dst, const uint32_t *src, uint32_t n, uint8_t bw)
+{
+    uint32_t nw = packed_words(n, bw);
+    memset(dst, 0, (size_t)nw * 4u);
+    uint64_t acc = 0;
+    int acc_bits = 0;
+    uint32_t wo = 0;
+    uint32_t mask = (bw == 32) ? 0xFFFFFFFFu : ((1u << bw) - 1u);
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t v = src[i] & mask;
+        acc |= ((uint64_t)v) << acc_bits;
+        acc_bits += bw;
+        while (acc_bits >= 32) {
+            uint32_t word = (uint32_t)acc;
+            memcpy(dst + wo * 4u, &word, 4);
+            wo++;
+            acc >>= 32;
+            acc_bits -= 32;
+        }
+    }
+    if (acc_bits > 0) {
+        uint32_t word = (uint32_t)acc;
+        memcpy(dst + wo * 4u, &word, 4);
+    }
+}
+
+static void unpack_u32_bits(uint32_t *dst, const uint8_t *src, uint32_t n, uint8_t bw)
+{
+    uint32_t mask = (bw == 32) ? 0xFFFFFFFFu : ((1u << bw) - 1u);
+    uint64_t acc = 0;
+    int acc_bits = 0;
+    uint32_t wo = 0;
+    uint32_t nw = packed_words(n, bw);
+    for (uint32_t i = 0; i < n; i++) {
+        while (acc_bits < bw) {
+            uint32_t word = 0;
+            if (wo < nw) memcpy(&word, src + wo * 4u, 4);
+            acc |= ((uint64_t)word) << acc_bits;
+            acc_bits += 32;
+            wo++;
+        }
+        dst[i] = (uint32_t)acc & mask;
+        acc >>= bw;
+        acc_bits -= bw;
+    }
+}
+
+static int all_equal_rows(const uint8_t *vals, uint32_t n, uint32_t width)
+{
+    if (n <= 1) return 1;
+    for (uint32_t i = 1; i < n; i++)
+        if (memcmp(vals + (size_t)i * width, vals, width) != 0) return 0;
+    return 1;
+}
+
+/* Encode a fixed-width column. *out is malloc'd when *out_len > 0 (and may be
+ * malloc'd even when len==0 — caller always frees). */
+static int encode_fixed(const void *payload, uint32_t n, uint8_t typ,
+                        uint8_t *codec, uint8_t *bit_width,
+                        uint8_t **out, uint32_t *out_len)
+{
+    uint32_t width = type_width(typ);
+    const uint8_t *vals = (const uint8_t *)payload;
+    *codec = ETAP_CODEC_RAW;
+    *bit_width = 0;
+    *out = NULL;
+    *out_len = 0;
+
+    if (n == 0 || width == 0)
+        return 0;
+
+    uint32_t raw_sz = n * width;
+
+    if (all_equal_rows(vals, n, width)) {
+        *out = (uint8_t *)malloc(width);
+        if (!*out) return -1;
+        memcpy(*out, vals, width);
+        *out_len = width;
+        *codec = ETAP_CODEC_CONST;
+        return 0;
+    }
+
+    uint8_t *best = (uint8_t *)malloc(raw_sz);
+    if (!best) return -1;
+    memcpy(best, vals, raw_sz);
+    uint32_t best_len = raw_sz;
+    uint8_t best_codec = ETAP_CODEC_RAW;
+    uint8_t best_bw = 0;
+
+    if (!is_int_like(typ)) {
+        *out = best;
+        *out_len = best_len;
+        return 0;
+    }
+
+    int signed_t = is_signed_type(typ);
+
+    if (try_delta_type(typ) && n >= 2) {
+        int ok = 1;
+        uint32_t nd = n - 1;
+        uint32_t *dz = (uint32_t *)malloc(nd * 4u);
+        if (!dz) { free(best); return -1; }
+        uint32_t maxz = 0;
+        for (uint32_t i = 1; i < n; i++) {
+            uint64_t a = load_u(vals + (i - 1) * width, width);
+            uint64_t b = load_u(vals + i * width, width);
+            int64_t dlt = (int64_t)b - (int64_t)a;
+            uint64_t z = zigzag64(dlt);
+            if (z > 0xFFFFFFFFull) { ok = 0; break; }
+            dz[i - 1] = (uint32_t)z;
+            if (dz[i - 1] > maxz) maxz = dz[i - 1];
+        }
+        if (ok) {
+            uint8_t bw = bits_for(maxz);
+            uint32_t tlen = width + packed_words(nd, bw) * 4u;
+            if (tlen < best_len) {
+                uint8_t *buf = (uint8_t *)malloc(tlen);
+                if (!buf) { free(dz); free(best); return -1; }
+                memcpy(buf, vals, width);
+                pack_u32_bits(buf + width, dz, nd, bw);
+                free(best);
+                best = buf;
+                best_len = tlen;
+                best_codec = ETAP_CODEC_DELTA;
+                best_bw = bw;
+            }
+        }
+        free(dz);
+    }
+
+    {
+        int ok = 1;
+        uint64_t base_u = 0, range = 0;
+        if (signed_t) {
+            int64_t minv = load_s(vals, width);
+            int64_t maxv = minv;
+            for (uint32_t i = 1; i < n; i++) {
+                int64_t v = load_s(vals + i * width, width);
+                if (v < minv) minv = v;
+                if (v > maxv) maxv = v;
+            }
+            if ((uint64_t)(maxv - minv) > 0xFFFFFFFFull) ok = 0;
+            else {
+                range = (uint64_t)(maxv - minv);
+                base_u = (uint64_t)minv;
+            }
+        } else {
+            uint64_t umin = load_u(vals, width);
+            uint64_t umax = umin;
+            for (uint32_t i = 1; i < n; i++) {
+                uint64_t v = load_u(vals + i * width, width);
+                if (v < umin) umin = v;
+                if (v > umax) umax = v;
+            }
+            if (umax - umin > 0xFFFFFFFFull) ok = 0;
+            else {
+                range = umax - umin;
+                base_u = umin;
+            }
+        }
+        if (ok) {
+            uint8_t bw = bits_for((uint32_t)range);
+            uint32_t tlen = width + packed_words(n, bw) * 4u;
+            if (tlen < best_len) {
+                uint32_t *res = (uint32_t *)malloc(n * 4u);
+                uint8_t *buf = (uint8_t *)malloc(tlen);
+                if (!res || !buf) { free(res); free(buf); free(best); return -1; }
+                for (uint32_t i = 0; i < n; i++) {
+                    if (signed_t) {
+                        int64_t v = load_s(vals + i * width, width);
+                        res[i] = (uint32_t)(v - (int64_t)base_u);
+                    } else {
+                        res[i] = (uint32_t)(load_u(vals + i * width, width) - base_u);
+                    }
+                }
+                memset(buf, 0, tlen);
+                store_u(buf, width, base_u);
+                pack_u32_bits(buf + width, res, n, bw);
+                free(res);
+                free(best);
+                best = buf;
+                best_len = tlen;
+                best_codec = ETAP_CODEC_FOR;
+                best_bw = bw;
+            }
+        }
+    }
+
+    {
+        uint8_t *dictp = (uint8_t *)malloc(256u * width);
+        uint32_t *idx = (uint32_t *)malloc(n * 4u);
+        if (!dictp || !idx) { free(dictp); free(idx); free(best); return -1; }
+        uint32_t uniq = 0;
+        int overflow = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            const uint8_t *row = vals + i * width;
+            uint32_t found = uniq;
+            for (uint32_t k = 0; k < uniq; k++) {
+                if (memcmp(dictp + k * width, row, width) == 0) { found = k; break; }
+            }
+            if (found == uniq) {
+                if (uniq >= 256) { overflow = 1; break; }
+                memcpy(dictp + uniq * width, row, width);
+                found = uniq++;
+            }
+            idx[i] = found;
+        }
+        if (!overflow && uniq > 0 && uniq <= n / 2 && uniq <= 256) {
+            uint8_t bw = bits_for(uniq > 1 ? uniq - 1 : 1);
+            uint32_t dict_start = 4; /* u16 dict_n + 2 pad */
+            uint32_t after = align4(dict_start + uniq * width);
+            uint32_t tlen = after + packed_words(n, bw) * 4u;
+            if (tlen < best_len) {
+                uint8_t *buf = (uint8_t *)calloc(1, tlen);
+                if (!buf) { free(dictp); free(idx); free(best); return -1; }
+                uint16_t dn = (uint16_t)uniq;
+                memcpy(buf, &dn, 2);
+                memcpy(buf + dict_start, dictp, uniq * width);
+                pack_u32_bits(buf + after, idx, n, bw);
+                free(best);
+                best = buf;
+                best_len = tlen;
+                best_codec = ETAP_CODEC_DICT;
+                best_bw = bw;
+            }
+        }
+        free(dictp);
+        free(idx);
+    }
+
+    {
+        uint32_t n_runs = 1;
+        for (uint32_t i = 1; i < n; i++)
+            if (memcmp(vals + i * width, vals + (i - 1) * width, width) != 0)
+                n_runs++;
+        if (n_runs <= n / 4) {
+            uint32_t tlen = 4 + n_runs * (width + 4);
+            if (tlen < best_len) {
+                uint8_t *buf = (uint8_t *)malloc(tlen);
+                if (!buf) { free(best); return -1; }
+                memcpy(buf, &n_runs, 4);
+                uint32_t o = 4, i = 0;
+                while (i < n) {
+                    uint32_t j = i + 1;
+                    while (j < n && memcmp(vals + j * width, vals + i * width, width) == 0)
+                        j++;
+                    uint32_t rl = j - i;
+                    memcpy(buf + o, vals + i * width, width);
+                    o += width;
+                    memcpy(buf + o, &rl, 4);
+                    o += 4;
+                    i = j;
+                }
+                free(best);
+                best = buf;
+                best_len = tlen;
+                best_codec = ETAP_CODEC_RLE;
+                best_bw = 0;
+            }
+        }
+    }
+
+    *codec = best_codec;
+    *bit_width = best_bw;
+    *out = best;
+    *out_len = best_len;
+    return 0;
+}
+
 typedef struct {
     uint32_t col_id;
     uint16_t type;
@@ -772,38 +1143,33 @@ typedef struct {
 
 static int write_colgroup(wbuf *w, uint32_t n_rows, const col_in *cols, int n_cols)
 {
-    wb_pad8(w);
+    wb_pad4(w);
     uint32_t start = w->len;
     int any_valid = 0;
     for (int i = 0; i < n_cols; i++)
         if (cols[i].valid) any_valid = 1;
-    uint32_t hdr = 8 + 16u * (uint32_t)n_cols;
+    uint32_t hdr = 4 + 16u * (uint32_t)n_cols;
     if (wb_res(w, hdr) != 0) return -1;
     uint8_t *base = w->p + start;
     uint16_t nc = (uint16_t)n_cols;
     uint16_t fl = any_valid ? 1 : 0;
     memcpy(base + 0, &nc, 2);
     memcpy(base + 2, &fl, 2);
-    memcpy(base + 4, &n_rows, 4);
     w->len = start + hdr;
 
-    etap_col_desc *desc = (etap_col_desc *)(base + 8);
-    memset(desc, 0, 16u * (uint32_t)n_cols);
+    /* descriptors live at base+4 and stay valid: wbuf does not reallocate. */
+    uint8_t *desc_base = base + 4;
+    memset(desc_base, 0, 16u * (uint32_t)n_cols);
 
     for (int i = 0; i < n_cols; i++) {
-        wb_pad8(w);
+        wb_pad4(w);
         uint32_t data_off = w->len - start;
-        uint32_t data_len = 0;
-        if (cols[i].valid) {
-            uint32_t vlen = align8((n_rows + 7u) / 8u);
-            if (wb_res(w, vlen) != 0) return -1;
-            memset(w->p + w->len, 0, vlen);
-            uint32_t raw = (n_rows + 7u) / 8u;
-            memcpy(w->p + w->len, cols[i].valid, raw);
-            w->len += vlen;
-            data_len += vlen;
-        }
-        if (cols[i].flags & 2) {
+        uint32_t payload_len = 0;
+        uint8_t codec = ETAP_CODEC_RAW;
+        uint8_t bw = 0;
+        uint8_t flags = (uint8_t)cols[i].flags;
+
+        if (cols[i].flags & ETAP_COLF_VARLEN) {
             uint32_t offb = 4u * (n_rows + 1u);
             if (wb_res(w, offb + cols[i].values_len) != 0) return -1;
             memcpy(w->p + w->len, cols[i].offsets, offb);
@@ -812,22 +1178,42 @@ static int write_colgroup(wbuf *w, uint32_t n_rows, const col_in *cols, int n_co
                 memcpy(w->p + w->len, cols[i].payload, cols[i].values_len);
                 w->len += cols[i].values_len;
             }
-            data_len += offb + cols[i].values_len;
+            payload_len = offb + cols[i].values_len;
+            codec = ETAP_CODEC_RAW;
         } else {
-            uint32_t nb = n_rows * (uint32_t)cols[i].width;
-            if (wb_res(w, nb) != 0) return -1;
-            if (nb) memcpy(w->p + w->len, cols[i].payload, nb);
-            w->len += nb;
-            data_len += nb;
+            uint8_t *tmp = NULL;
+            uint32_t tlen = 0;
+            if (encode_fixed(cols[i].payload, n_rows, (uint8_t)cols[i].type,
+                             &codec, &bw, &tmp, &tlen) != 0)
+                return -1;
+            if (wb_res(w, tlen) != 0) { free(tmp); return -1; }
+            if (tlen) memcpy(w->p + w->len, tmp, tlen);
+            w->len += tlen;
+            payload_len = tlen;
+            free(tmp);
         }
-        desc[i].col_id = cols[i].col_id;
-        desc[i].type = cols[i].type;
-        desc[i].flags = cols[i].flags;
-        if (cols[i].valid) desc[i].flags |= 1;
-        desc[i].data_off = data_off;
-        desc[i].data_len = data_len;
+
+        if (cols[i].valid) {
+            uint32_t vlen = (n_rows + 7u) / 8u;
+            if (wb_res(w, vlen) != 0) return -1;
+            memset(w->p + w->len, 0, vlen);
+            memcpy(w->p + w->len, cols[i].valid, vlen);
+            w->len += vlen;
+            payload_len += vlen;
+            flags |= ETAP_COLF_VALIDITY;
+        }
+
+        etap_col_desc d;
+        memset(&d, 0, sizeof(d));
+        d.col_id = cols[i].col_id;
+        d.type = (uint8_t)cols[i].type;
+        d.codec = codec;
+        d.bit_width = bw;
+        d.flags = flags;
+        d.data_off = data_off;
+        d.data_len = payload_len;
+        memcpy(desc_base + 16u * (uint32_t)i, &d, 16);
     }
-    wb_pad8(w);
     return (int)(w->len - start);
 }
 
@@ -853,6 +1239,8 @@ typedef struct {
     uint32_t pkt_idx[64];
 } flow_evt;
 
+#define PAYLOAD_RESERVE 512u
+
 static int build_batch(etap_sub *s, uint8_t *buf, uint32_t cap, uint32_t *out_sz)
 {
     const sub_cfg *cfg = &s->cfg;
@@ -868,14 +1256,14 @@ static int build_batch(etap_sub *s, uint8_t *buf, uint32_t cap, uint32_t *out_sz
     if (n == 0) return 1; /* exhausted */
 
     wbuf w = { buf, cap, 0 };
-    if (wb_res(&w, ETAP_BATCH_HDR_LEN) != 0) return -1;
-    w.len = ETAP_BATCH_HDR_LEN;
+    if (wb_res(&w, PAYLOAD_RESERVE) != 0) return -1;
+    memset(buf, 0, PAYLOAD_RESERVE);
+    w.len = PAYLOAD_RESERVE;
 
     sec_tmp secs[16];
     int nsec = 0;
     uint32_t flags = 0;
 
-    /* pending gaps */
     uint64_t gap_pkts = s->pending_gap_pkts;
     uint64_t gap_bytes = s->pending_gap_bytes;
     uint64_t gap_first = s->pending_gap_first;
@@ -887,7 +1275,6 @@ static int build_batch(etap_sub *s, uint8_t *buf, uint32_t cap, uint32_t *out_sz
         if (pkts[i].trunc) any_trunc = 1;
     if (any_trunc) flags |= ETAP_BF_TRUNCATED;
 
-    /* PACKET_BYTES + per-row slice */
     uint8_t slices[512][512];
     uint32_t slen[512], soff[512];
     uint32_t bytes_off = 0, bytes_sz = 0;
@@ -896,31 +1283,24 @@ static int build_batch(etap_sub *s, uint8_t *buf, uint32_t cap, uint32_t *out_sz
 
     if ((cfg->view_mask & ETAP_VIEW_PACKET) &&
         cfg->packet.bytes_mode != ETAP_BYTES_NONE) {
-        wb_pad8(&w);
+        wb_pad4(&w);
         bytes_off = w.len;
         for (uint32_t i = 0; i < n; i++) {
-            w.len = align8(w.len);
             soff[i] = w.len - bytes_off;
             slen[i] = slice_packet(&cfg->packet, &pkts[i], slices[i]);
-            /* For range/prefix, cap_len in meta is captured length (platform snap),
-             * bytes_len is what was copied into the batch. */
             if (wb_res(&w, slen[i]) != 0) return -1;
             if (slen[i]) memcpy(w.p + w.len, slices[i], slen[i]);
             w.len += slen[i];
         }
-        wb_pad8(&w);
         bytes_sz = w.len - bytes_off;
         if (add_section(secs, &nsec, ETAP_SEC_PACKET_BYTES, n, bytes_off, bytes_sz) != 0)
             return -1;
-        /* If prefix shorter than cap, mark truncated-in-delivery? Only if we cut more.
-         * Platform capture truncation is already in pkt.flags. */
         for (uint32_t i = 0; i < n; i++) {
             if (slen[i] < pkts[i].cap_len && cfg->packet.bytes_mode != ETAP_BYTES_NONE)
                 pkts[i].flags |= ETAP_RF_TRUNCATED;
         }
     }
 
-    /* PACKET_META columns */
     if (cfg->view_mask & ETAP_VIEW_PACKET) {
         uint64_t col_pkt[512], col_flow[512], col_ts[512];
         uint32_t col_wire[512], col_cap[512], col_ifx[512], col_boff[512], col_blen[512];
@@ -964,9 +1344,8 @@ static int build_batch(etap_sub *s, uint8_t *buf, uint32_t cap, uint32_t *out_sz
             ADD_META(0xFFFFFFFFu, ETAP_COL_BYTES_LEN, ETAP_T_U32, col_blen, 4);
         }
 #undef ADD_META
-        /* has_meta for the last two used 0xFFFFFFFF so always true - good */
 
-        wb_pad8(&w);
+        wb_pad4(&w);
         uint32_t off = w.len;
         int sz = write_colgroup(&w, n, cols, nc);
         if (sz < 0) return -1;
@@ -974,9 +1353,10 @@ static int build_batch(etap_sub *s, uint8_t *buf, uint32_t cap, uint32_t *out_sz
             return -1;
     }
 
-    /* PARSE view: one row per packet */
     uint32_t nparse = 0;
-    etap_parse_index_row pi[512];
+    uint64_t p_pkt[512], p_msg[512];
+    uint32_t p_proto[512];
+    uint16_t p_moff[512], p_mlen[512], p_pfl[512];
     uint32_t v_src[512], v_dst[512];
     uint16_t v_sp[512], v_dp[512];
     uint8_t  val_src[64], val_dst[64], val_sp[64], val_dp[64], val_sni[64], val_host[64];
@@ -994,19 +1374,18 @@ static int build_batch(etap_sub *s, uint8_t *buf, uint32_t cap, uint32_t *out_sz
         sni_off[0] = 0;
         host_off[0] = 0;
         for (uint32_t i = 0; i < n; i++) {
-            etap_parse_index_row *r = &pi[nparse];
-            memset(r, 0, sizeof(*r));
-            r->pkt_id = pkts[i].pkt_id;
-            r->msg_id = pkts[i].pkt_id; /* one message per packet in this sim */
-            r->proto_id = (pkts[i].kind == 0) ? ETAP_PROTO_HTTP : ETAP_PROTO_TLS;
-            r->msg_off = 54;
+            p_pkt[nparse] = pkts[i].pkt_id;
+            p_msg[nparse] = pkts[i].pkt_id;
+            p_proto[nparse] = (pkts[i].kind == 0) ? ETAP_PROTO_HTTP : ETAP_PROTO_TLS;
+            p_moff[nparse] = 54;
+            p_pfl[nparse] = 0;
             if (pkts[i].cap_len > 54)
-                r->msg_len = (uint16_t)(pkts[i].cap_len - 54);
+                p_mlen[nparse] = (uint16_t)(pkts[i].cap_len - 54);
             else {
-                r->msg_len = 0;
-                r->flags |= ETAP_RF_PARSE_INCOMPLETE;
+                p_mlen[nparse] = 0;
+                p_pfl[nparse] |= ETAP_RF_PARSE_INCOMPLETE;
             }
-            if (pkts[i].trunc) r->flags |= ETAP_RF_TRUNCATED;
+            if (pkts[i].trunc) p_pfl[nparse] |= ETAP_RF_TRUNCATED;
             v_src[nparse] = pkts[i].src;
             v_dst[nparse] = pkts[i].dst;
             v_sp[nparse] = pkts[i].sport;
@@ -1028,39 +1407,41 @@ static int build_batch(etap_sub *s, uint8_t *buf, uint32_t cap, uint32_t *out_sz
             host_off[nparse + 1] = host_len;
             nparse++;
         }
-        wb_pad8(&w);
+
+        col_in icols[6];
+        int inc = 0;
+        icols[inc++] = (col_in){ ETAP_PCOL_PKT_ID,   ETAP_T_U64, 0, p_pkt,   NULL, NULL, 0, 8 };
+        icols[inc++] = (col_in){ ETAP_PCOL_MSG_ID,   ETAP_T_U64, 0, p_msg,   NULL, NULL, 0, 8 };
+        icols[inc++] = (col_in){ ETAP_PCOL_PROTO_ID, ETAP_T_U32, 0, p_proto, NULL, NULL, 0, 4 };
+        icols[inc++] = (col_in){ ETAP_PCOL_MSG_OFF,  ETAP_T_U16, 0, p_moff,  NULL, NULL, 0, 2 };
+        icols[inc++] = (col_in){ ETAP_PCOL_MSG_LEN,  ETAP_T_U16, 0, p_mlen,  NULL, NULL, 0, 2 };
+        icols[inc++] = (col_in){ ETAP_PCOL_FLAGS,    ETAP_T_U16, 0, p_pfl,   NULL, NULL, 0, 2 };
+        wb_pad4(&w);
         uint32_t ioff = w.len;
-        if (wb_res(&w, nparse * (uint32_t)sizeof(etap_parse_index_row)) != 0) return -1;
-        memcpy(w.p + w.len, pi, nparse * sizeof(etap_parse_index_row));
-        w.len += nparse * (uint32_t)sizeof(etap_parse_index_row);
-        wb_pad8(&w);
-        if (add_section(secs, &nsec, ETAP_SEC_PARSE_INDEX, nparse, ioff,
-                        w.len - ioff) != 0)
+        int isz = write_colgroup(&w, nparse, icols, inc);
+        if (isz < 0) return -1;
+        if (add_section(secs, &nsec, ETAP_SEC_PARSE_INDEX, nparse, ioff, (uint32_t)isz) != 0)
             return -1;
 
         col_in cols[16];
         int nc = 0;
         const parse_sel *ps = &cfg->parse;
-        if (has_field(ps, ETAP_FLD_IPV4_SRC)) {
+        if (has_field(ps, ETAP_FLD_IPV4_SRC))
             cols[nc++] = (col_in){ ETAP_FLD_IPV4_SRC, ETAP_T_IPV4, 0, v_src, val_src, NULL, 0, 4 };
-        }
-        if (has_field(ps, ETAP_FLD_IPV4_DST)) {
+        if (has_field(ps, ETAP_FLD_IPV4_DST))
             cols[nc++] = (col_in){ ETAP_FLD_IPV4_DST, ETAP_T_IPV4, 0, v_dst, val_dst, NULL, 0, 4 };
-        }
-        if (has_field(ps, ETAP_FLD_TCP_SPORT)) {
+        if (has_field(ps, ETAP_FLD_TCP_SPORT))
             cols[nc++] = (col_in){ ETAP_FLD_TCP_SPORT, ETAP_T_U16, 0, v_sp, val_sp, NULL, 0, 2 };
-        }
-        if (has_field(ps, ETAP_FLD_TCP_DPORT)) {
+        if (has_field(ps, ETAP_FLD_TCP_DPORT))
             cols[nc++] = (col_in){ ETAP_FLD_TCP_DPORT, ETAP_T_U16, 0, v_dp, val_dp, NULL, 0, 2 };
-        }
-        if (has_field(ps, ETAP_FLD_TLS_SNI)) {
-            cols[nc++] = (col_in){ ETAP_FLD_TLS_SNI, ETAP_T_BYTES, 3, sni_heap, val_sni, sni_off, sni_len, 0 };
-        }
-        if (has_field(ps, ETAP_FLD_HTTP_HOST)) {
-            cols[nc++] = (col_in){ ETAP_FLD_HTTP_HOST, ETAP_T_BYTES, 3, host_heap, val_host, host_off, host_len, 0 };
-        }
+        if (has_field(ps, ETAP_FLD_TLS_SNI))
+            cols[nc++] = (col_in){ ETAP_FLD_TLS_SNI, ETAP_T_BYTES, ETAP_COLF_VARLEN | ETAP_COLF_VALIDITY,
+                                   sni_heap, val_sni, sni_off, sni_len, 0 };
+        if (has_field(ps, ETAP_FLD_HTTP_HOST))
+            cols[nc++] = (col_in){ ETAP_FLD_HTTP_HOST, ETAP_T_BYTES, ETAP_COLF_VARLEN | ETAP_COLF_VALIDITY,
+                                   host_heap, val_host, host_off, host_len, 0 };
         if (nc > 0) {
-            wb_pad8(&w);
+            wb_pad4(&w);
             uint32_t off = w.len;
             int sz = write_colgroup(&w, nparse, cols, nc);
             if (sz < 0) return -1;
@@ -1069,9 +1450,6 @@ static int build_batch(etap_sub *s, uint8_t *buf, uint32_t cap, uint32_t *out_sz
         }
     }
 
-    /* FLOW view: emit New on first packet of a flow in this batch, else Update.
-     * Expire is not emitted in the pull generator (flows reincarnate after budget
-     * — we emit Expire then New when a logical flow wraps). */
     flow_evt evs[16];
     uint32_t ne = 0;
     if (cfg->view_mask & ETAP_VIEW_FLOW) {
@@ -1085,7 +1463,7 @@ static int build_batch(etap_sub *s, uint8_t *buf, uint32_t cap, uint32_t *out_sz
                 found = (int)ne++;
                 memset(&evs[found], 0, sizeof(evs[found]));
                 evs[found].flow_id = fid;
-                evs[found].event = pkts[i].new_flow ? 1 : 2; /* New / Update */
+                evs[found].event = pkts[i].new_flow ? 1 : 2;
                 evs[found].state = 2;
                 evs[found].ifindex = pkts[i].ifindex;
                 evs[found].start_ns = pkts[i].flow->start_ns;
@@ -1101,41 +1479,49 @@ static int build_batch(etap_sub *s, uint8_t *buf, uint32_t cap, uint32_t *out_sz
             if (evs[found].n_pkts_idx < 64)
                 evs[found].pkt_idx[evs[found].n_pkts_idx++] = i;
         }
-        /* If a flow just hit its budget, mark it dead so the next packet reincarnates.
-         * Emit Expire only when the wrapping packet is *not* in this batch; the
-         * current batch already has the last packets as Update/New. */
         for (int fi = 0; fi < 3; fi++) {
             sim_flow *f = &s->flows[fi];
             if (f->alive && f->emitted >= flow_budget(f->kind))
                 f->alive = 0;
         }
 
-        etap_flow_meta_row fr[16];
-        memset(fr, 0, sizeof(fr));
+        uint64_t f_id[16], f_start[16], f_last[16], f_p0[16], f_p1[16];
+        uint8_t  f_ev[16], f_st[16];
+        uint16_t f_fl[16];
+        uint32_t f_ifx[16];
         uint64_t ffwd[16], frev[16], bfwd[16], brev[16], dur[16];
         for (uint32_t i = 0; i < ne; i++) {
-            fr[i].flow_id = evs[i].flow_id;
-            fr[i].event = evs[i].event;
-            fr[i].state = evs[i].state;
-            fr[i].flags = evs[i].flags;
-            fr[i].ifindex = evs[i].ifindex;
-            fr[i].start_ns = evs[i].start_ns;
-            fr[i].last_ns = evs[i].last_ns;
-            fr[i].pkt_id_first = evs[i].pkt_id_first;
-            fr[i].pkt_id_last = evs[i].pkt_id_last;
+            f_id[i] = evs[i].flow_id;
+            f_ev[i] = evs[i].event;
+            f_st[i] = evs[i].state;
+            f_fl[i] = evs[i].flags;
+            f_ifx[i] = evs[i].ifindex;
+            f_start[i] = evs[i].start_ns;
+            f_last[i] = evs[i].last_ns;
+            f_p0[i] = evs[i].pkt_id_first;
+            f_p1[i] = evs[i].pkt_id_last;
             ffwd[i] = evs[i].pkts_fwd;
             frev[i] = evs[i].pkts_rev;
             bfwd[i] = evs[i].bytes_fwd;
             brev[i] = evs[i].bytes_rev;
             dur[i] = evs[i].duration_ns;
         }
-        wb_pad8(&w);
+        col_in mcols[9];
+        int mnc = 0;
+        mcols[mnc++] = (col_in){ ETAP_FCOL_FLOW_ID,      ETAP_T_U64,   0, f_id,    NULL, NULL, 0, 8 };
+        mcols[mnc++] = (col_in){ ETAP_FCOL_EVENT,        ETAP_T_U8,    0, f_ev,    NULL, NULL, 0, 1 };
+        mcols[mnc++] = (col_in){ ETAP_FCOL_STATE,        ETAP_T_U8,    0, f_st,    NULL, NULL, 0, 1 };
+        mcols[mnc++] = (col_in){ ETAP_FCOL_FLAGS,        ETAP_T_U16,   0, f_fl,    NULL, NULL, 0, 2 };
+        mcols[mnc++] = (col_in){ ETAP_FCOL_IFINDEX,      ETAP_T_U32,   0, f_ifx,   NULL, NULL, 0, 4 };
+        mcols[mnc++] = (col_in){ ETAP_FCOL_START_NS,     ETAP_T_TS_NS, 0, f_start, NULL, NULL, 0, 8 };
+        mcols[mnc++] = (col_in){ ETAP_FCOL_LAST_NS,      ETAP_T_TS_NS, 0, f_last,  NULL, NULL, 0, 8 };
+        mcols[mnc++] = (col_in){ ETAP_FCOL_PKT_ID_FIRST, ETAP_T_U64,   0, f_p0,    NULL, NULL, 0, 8 };
+        mcols[mnc++] = (col_in){ ETAP_FCOL_PKT_ID_LAST,  ETAP_T_U64,   0, f_p1,    NULL, NULL, 0, 8 };
+        wb_pad4(&w);
         uint32_t moff = w.len;
-        if (wb_res(&w, ne * (uint32_t)sizeof(etap_flow_meta_row)) != 0) return -1;
-        memcpy(w.p + w.len, fr, ne * sizeof(etap_flow_meta_row));
-        w.len += ne * (uint32_t)sizeof(etap_flow_meta_row);
-        wb_pad8(&w);
-        if (add_section(secs, &nsec, ETAP_SEC_FLOW_META, ne, moff, w.len - moff) != 0)
+        int msz = write_colgroup(&w, ne, mcols, mnc);
+        if (msz < 0) return -1;
+        if (add_section(secs, &nsec, ETAP_SEC_FLOW_META, ne, moff, (uint32_t)msz) != 0)
             return -1;
 
         col_in cols[8];
@@ -1152,7 +1538,7 @@ static int build_batch(etap_sub *s, uint8_t *buf, uint32_t cap, uint32_t *out_sz
         if (has_feat(fs, ETAP_FEAT_DURATION))
             cols[nc++] = (col_in){ ETAP_FEAT_DURATION, ETAP_T_DUR_NS, 0, dur, NULL, NULL, 0, 8 };
         if (nc) {
-            wb_pad8(&w);
+            wb_pad4(&w);
             uint32_t off = w.len;
             int sz = write_colgroup(&w, ne, cols, nc);
             if (sz < 0) return -1;
@@ -1160,33 +1546,20 @@ static int build_batch(etap_sub *s, uint8_t *buf, uint32_t cap, uint32_t *out_sz
                 return -1;
         }
         if (cfg->flow.flags & 1) {
-            /* FLOW_PKTS: offsets + pkt_id list */
-            uint32_t offs[17];
             uint64_t ids[16 * 64];
             uint32_t nids = 0;
-            offs[0] = 0;
+            uint32_t boffs[17];
+            boffs[0] = 0;
             for (uint32_t i = 0; i < ne; i++) {
                 for (uint32_t k = 0; k < evs[i].n_pkts_idx; k++) {
                     uint32_t pi_ = evs[i].pkt_idx[k];
                     ids[nids++] = pkts[pi_].pkt_id;
                 }
-                offs[i + 1] = nids * 8u; /* byte offsets into values? Spec: varlen col of pkt_id */
+                boffs[i + 1] = nids * 8u;
             }
-            /* Use byte offsets into the u64 values blob. */
-            /* Recompute byte offsets */
-            uint32_t cursor = 0;
-            uint32_t boffs[17];
-            boffs[0] = 0;
-            uint32_t ti = 0;
-            for (uint32_t i = 0; i < ne; i++) {
-                cursor += evs[i].n_pkts_idx * 8u;
-                boffs[i + 1] = cursor;
-                ti += evs[i].n_pkts_idx;
-            }
-            (void)offs; (void)ti;
-            wb_pad8(&w);
+            wb_pad4(&w);
             uint32_t off = w.len;
-            col_in pcol = { 1, ETAP_T_U64, 2, ids, NULL, boffs, nids * 8u, 8 };
+            col_in pcol = { 1, ETAP_T_U64, ETAP_COLF_VARLEN, ids, NULL, boffs, nids * 8u, 8 };
             int sz = write_colgroup(&w, ne, &pcol, 1);
             if (sz < 0) return -1;
             if (add_section(secs, &nsec, ETAP_SEC_FLOW_PKTS, ne, off, (uint32_t)sz) != 0)
@@ -1196,31 +1569,45 @@ static int build_batch(etap_sub *s, uint8_t *buf, uint32_t cap, uint32_t *out_sz
 
     if (s->schema_needs_embed) {
         flags |= ETAP_BF_SCHEMA_EMBEDDED;
-        wb_pad8(&w);
+        wb_pad4(&w);
         uint32_t off = w.len;
         uint32_t payload[4] = { s->schema_id, s->epoch, cfg->view_mask, cfg->packet.meta_mask };
         if (wb_res(&w, sizeof(payload)) != 0) return -1;
         memcpy(w.p + w.len, payload, sizeof(payload));
         w.len += sizeof(payload);
-        wb_pad8(&w);
         if (add_section(secs, &nsec, ETAP_SEC_SCHEMA, 1, off, w.len - off) != 0)
             return -1;
         s->schema_needs_embed = 0;
     }
 
-    /* section directory */
-    wb_pad8(&w);
-    uint32_t sec_off = w.len;
-    if (wb_res(&w, (uint32_t)nsec * sizeof(etap_section)) != 0) return -1;
+    uint32_t hdr_len = gap_pkts ? ETAP_BATCH_HDR_GAP_LEN : ETAP_BATCH_HDR_PREFIX_LEN;
+    uint32_t dir_off = hdr_len;
+    uint32_t dir_sz = (uint32_t)nsec * ETAP_SECTION_LEN;
+    uint32_t new_base = align4(dir_off + dir_sz);
+    uint32_t payload_end = w.len;
+    uint32_t payload_sz = payload_end - PAYLOAD_RESERVE;
+    int32_t shift = (int32_t)new_base - (int32_t)PAYLOAD_RESERVE;
+    if (shift > 0) {
+        if (wb_res(&w, (uint32_t)shift) != 0) return -1;
+        memmove(w.p + new_base, w.p + PAYLOAD_RESERVE, payload_sz);
+    } else if (shift < 0) {
+        memmove(w.p + new_base, w.p + PAYLOAD_RESERVE, payload_sz);
+    }
+    w.len = new_base + payload_sz;
+    if (new_base > dir_off + dir_sz)
+        memset(w.p + dir_off + dir_sz, 0, new_base - (dir_off + dir_sz));
+    for (int i = 0; i < nsec; i++)
+        secs[i].off = (uint32_t)((int32_t)secs[i].off + shift);
+
     for (int i = 0; i < nsec; i++) {
         etap_section sc;
         memset(&sc, 0, sizeof(sc));
-        sc.kind = secs[i].kind;
+        sc.kind = (uint8_t)secs[i].kind;
+        sc.flags = 0;
         sc.count = secs[i].count;
         sc.off = secs[i].off;
         sc.size = secs[i].size;
-        memcpy(w.p + w.len, &sc, sizeof(sc));
-        w.len += (uint32_t)sizeof(sc);
+        memcpy(w.p + dir_off + (uint32_t)i * ETAP_SECTION_LEN, &sc, ETAP_SECTION_LEN);
     }
     uint32_t total = w.len;
 
@@ -1228,7 +1615,7 @@ static int build_batch(etap_sub *s, uint8_t *buf, uint32_t cap, uint32_t *out_sz
     memset(&hdr, 0, sizeof(hdr));
     hdr.magic = ETAP_MAGIC;
     hdr.version = ETAP_VERSION;
-    hdr.hdr_len = ETAP_BATCH_HDR_LEN;
+    hdr.hdr_len = (uint16_t)hdr_len;
     hdr.flags = flags;
     hdr.n_sections = (uint16_t)nsec;
     hdr.clock = 1;
@@ -1242,15 +1629,19 @@ static int build_batch(etap_sub *s, uint8_t *buf, uint32_t cap, uint32_t *out_sz
     hdr.n_packets = (cfg->view_mask & ETAP_VIEW_PACKET) ? n : 0;
     hdr.n_parse_rows = (cfg->view_mask & ETAP_VIEW_PARSE) ? nparse : 0;
     hdr.n_flows = (cfg->view_mask & ETAP_VIEW_FLOW) ? ne : 0;
+    hdr.producer_lag_us = 0;
+    hdr.crc32c = 0;
+    hdr.sections_off = dir_off;
+    hdr.total_size = total;
     hdr.gap_dropped_pkts = gap_pkts;
     hdr.gap_dropped_bytes = gap_bytes;
     hdr.gap_first_pkt_id = gap_first;
     hdr.gap_last_pkt_id = gap_last;
-    hdr.producer_lag_us = 0;
-    hdr.crc32c = 0;
-    hdr.sections_off = sec_off;
-    hdr.total_size = total;
-    memcpy(buf, &hdr, sizeof(hdr));
+    memcpy(buf, &hdr, ETAP_BATCH_HDR_PREFIX_LEN);
+    if (gap_pkts)
+        memcpy(buf + ETAP_BATCH_HDR_PREFIX_LEN,
+               (const uint8_t *)&hdr + ETAP_BATCH_HDR_PREFIX_LEN,
+               ETAP_BATCH_GAP_BLOCK_LEN);
 
     if (gap_pkts) {
         s->pending_gap_pkts = 0;
@@ -1263,6 +1654,9 @@ static int build_batch(etap_sub *s, uint8_t *buf, uint32_t cap, uint32_t *out_sz
     *out_sz = total;
     return 0;
 }
+
+static int decode_batch_hdr(const uint8_t *buf, uint32_t size, etap_batch_hdr *out);
+static void free_batch_cache(etap_batch *b);
 
 /* ---- slot helpers ---- */
 
@@ -1326,6 +1720,12 @@ static etap_batch *lease_slot(etap_sub *s, int si)
     b->slot_index = si;
     b->buf = sl->buf;
     b->size = sl->size;
+    if (decode_batch_hdr(b->buf, b->size, &b->hdr) != 0) {
+        free(b);
+        sl->state = SLOT_READY;
+        return NULL;
+    }
+    b->hdr_ok = 1;
     b->schema.schema_id = s->schema_id;
     b->schema.epoch = s->epoch;
     s->leased_batches++;
@@ -1449,58 +1849,228 @@ etap_status etap_release(etap_batch *batch)
         if (s->leased_batches) s->leased_batches--;
     }
     pthread_mutex_unlock(&s->mu);
+    free_batch_cache(batch);
     free(batch);
+    return ETAP_OK;
+}
+
+static int decode_batch_hdr(const uint8_t *buf, uint32_t size, etap_batch_hdr *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!buf || size < ETAP_BATCH_HDR_PREFIX_LEN) return -1;
+    memcpy(out, buf, ETAP_BATCH_HDR_PREFIX_LEN);
+    if (out->magic != ETAP_MAGIC || out->version != ETAP_VERSION) return -1;
+    if (out->hdr_len < ETAP_BATCH_HDR_PREFIX_LEN || out->hdr_len > size) return -1;
+    if (out->flags & ETAP_BF_HAS_GAP) {
+        if (out->hdr_len < ETAP_BATCH_HDR_GAP_LEN || size < ETAP_BATCH_HDR_GAP_LEN) return -1;
+        memcpy((uint8_t *)out + ETAP_BATCH_HDR_PREFIX_LEN,
+               buf + ETAP_BATCH_HDR_PREFIX_LEN,
+               ETAP_BATCH_GAP_BLOCK_LEN);
+    }
+    if (out->total_size > size || out->total_size < out->hdr_len) return -1;
+    if ((uint64_t)out->sections_off + (uint64_t)out->n_sections * ETAP_SECTION_LEN > out->total_size)
+        return -1;
+    return 0;
+}
+
+static void free_batch_cache(etap_batch *b)
+{
+    if (!b) return;
+    for (uint32_t i = 0; i < b->n_cache; i++) {
+        if (b->cache[i].owned) {
+            free(b->cache[i].data);
+            /* valid and offsets alias the raw buffer unless owned together;
+             * owned allocations are only the native data array. */
+        }
+    }
+    free(b->cache);
+    b->cache = NULL;
+    b->n_cache = b->cap_cache = 0;
+    free(b->parse_rows);
+    b->parse_rows = NULL;
+    b->n_parse_rows = 0;
+    b->parse_ready = 0;
+    free(b->flow_rows);
+    b->flow_rows = NULL;
+    b->n_flow_rows = 0;
+    b->flow_ready = 0;
+}
+
+static etap_status read_section(const etap_batch *b, uint16_t index, etap_section *out)
+{
+    if (!b || !b->hdr_ok || !out) return ETAP_INVALID;
+    if (index >= b->hdr.n_sections) return ETAP_INVALID;
+    uint32_t off = b->hdr.sections_off + (uint32_t)index * ETAP_SECTION_LEN;
+    if (off + ETAP_SECTION_LEN > b->size) return ETAP_SCHEMA;
+    memcpy(out, b->buf + off, ETAP_SECTION_LEN);
+    return ETAP_OK;
+}
+
+etap_status etap_batch_section(const etap_batch *batch, uint16_t index, etap_section *out)
+{
+    return read_section(batch, index, out);
+}
+
+static int find_sec(const etap_batch *b, uint16_t kind, etap_section *out)
+{
+    if (!b || !b->hdr_ok) return 0;
+    for (uint16_t i = 0; i < b->hdr.n_sections; i++) {
+        etap_section s;
+        if (read_section(b, i, &s) != ETAP_OK) return 0;
+        if (s.kind == kind) {
+            if (out) *out = s;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static etap_status unpack_col(const etap_batch *batch, const etap_section *s,
+                              uint32_t col_id, col_cache_ent *e)
+{
+    if (s->size < 4 || s->off + s->size > batch->size) return ETAP_SCHEMA;
+    const uint8_t *base = batch->buf + s->off;
+    uint16_t n_cols = 0, gflags = 0;
+    memcpy(&n_cols, base + 0, 2);
+    memcpy(&gflags, base + 2, 2);
+    (void)gflags;
+    if (4u + 16u * n_cols > s->size) return ETAP_SCHEMA;
+    etap_col_desc d;
+    int found = 0;
+    for (uint16_t i = 0; i < n_cols; i++) {
+        memcpy(&d, base + 4 + 16u * i, 16);
+        if (d.col_id == col_id) { found = 1; break; }
+    }
+    if (!found) return ETAP_INVALID;
+    uint32_t n_rows = s->count;
+    if (d.data_off + d.data_len > s->size) return ETAP_SCHEMA;
+    const uint8_t *dp = base + d.data_off;
+    uint32_t remain = d.data_len;
+    const uint8_t *valid = NULL;
+    if (d.flags & ETAP_COLF_VALIDITY) {
+        uint32_t vlen = (n_rows + 7u) / 8u;
+        if (remain < vlen) return ETAP_SCHEMA;
+        valid = dp + (remain - vlen);
+        remain -= vlen;
+    }
+
+    memset(e, 0, sizeof(*e));
+    e->type = (etap_type)d.type;
+    e->n = n_rows;
+    e->valid = (uint8_t *)valid;
+
+    if (d.flags & ETAP_COLF_VARLEN) {
+        uint32_t offb = 4u * (n_rows + 1u);
+        if (remain < offb) return ETAP_SCHEMA;
+        e->offsets = (uint32_t *)(void *)(dp);
+        e->data = (uint8_t *)(void *)(dp + offb);
+        e->owned = 0;
+        return ETAP_OK;
+    }
+
+    uint32_t width = type_width(d.type);
+    if (d.codec == ETAP_CODEC_RAW) {
+        e->data = (uint8_t *)(void *)dp;
+        e->owned = 0;
+        return ETAP_OK;
+    }
+
+    uint32_t nbytes = n_rows * width;
+    uint8_t *arr = (uint8_t *)calloc(1, nbytes ? nbytes : 1u);
+    if (!arr) return ETAP_NOMEM;
+
+    if (d.codec == ETAP_CODEC_CONST) {
+        if (remain < width) { free(arr); return ETAP_SCHEMA; }
+        for (uint32_t i = 0; i < n_rows; i++)
+            memcpy(arr + i * width, dp, width);
+    } else if (d.codec == ETAP_CODEC_FOR) {
+        if (remain < width) { free(arr); return ETAP_SCHEMA; }
+        uint8_t bw = d.bit_width;
+        if (bw < 1 || bw > 32) { free(arr); return ETAP_SCHEMA; }
+        uint32_t plen = packed_words(n_rows, bw) * 4u;
+        if (remain < width + plen) { free(arr); return ETAP_SCHEMA; }
+        uint64_t base_u = load_u(dp, width);
+        uint32_t *res = (uint32_t *)malloc(n_rows ? n_rows * 4u : 4u);
+        if (!res) { free(arr); return ETAP_NOMEM; }
+        unpack_u32_bits(res, dp + width, n_rows, bw);
+        for (uint32_t i = 0; i < n_rows; i++) {
+            if (is_signed_type(d.type)) {
+                int64_t v = (int64_t)base_u + (int64_t)res[i];
+                store_u(arr + i * width, width, (uint64_t)v);
+            } else {
+                store_u(arr + i * width, width, base_u + (uint64_t)res[i]);
+            }
+        }
+        free(res);
+    } else if (d.codec == ETAP_CODEC_DELTA) {
+        if (remain < width) { free(arr); return ETAP_SCHEMA; }
+        memcpy(arr, dp, width);
+        uint32_t nd = n_rows > 0 ? n_rows - 1 : 0;
+        if (nd) {
+            uint8_t bw = d.bit_width;
+            if (bw < 1 || bw > 32) { free(arr); return ETAP_SCHEMA; }
+            uint32_t plen = packed_words(nd, bw) * 4u;
+            if (remain < width + plen) { free(arr); return ETAP_SCHEMA; }
+            uint32_t *dz = (uint32_t *)malloc(nd * 4u);
+            if (!dz) { free(arr); return ETAP_NOMEM; }
+            unpack_u32_bits(dz, dp + width, nd, bw);
+            uint64_t cur = load_u(arr, width);
+            for (uint32_t i = 0; i < nd; i++) {
+                int64_t dlt = unzigzag64(dz[i]);
+                cur = (uint64_t)((int64_t)cur + dlt);
+                store_u(arr + (i + 1) * width, width, cur);
+            }
+            free(dz);
+        }
+    } else if (d.codec == ETAP_CODEC_DICT) {
+        if (remain < 2) { free(arr); return ETAP_SCHEMA; }
+        uint16_t dict_n = 0;
+        memcpy(&dict_n, dp, 2);
+        uint32_t dict_start = 4;
+        uint32_t dict_bytes = (uint32_t)dict_n * width;
+        if (remain < dict_start + dict_bytes) { free(arr); return ETAP_SCHEMA; }
+        const uint8_t *dict = dp + dict_start;
+        uint32_t after = align4(dict_start + dict_bytes);
+        uint8_t bw = d.bit_width;
+        if (bw < 1 || bw > 32) { free(arr); return ETAP_SCHEMA; }
+        uint32_t plen = packed_words(n_rows, bw) * 4u;
+        if (remain < after + plen) { free(arr); return ETAP_SCHEMA; }
+        uint32_t *idx = (uint32_t *)malloc(n_rows ? n_rows * 4u : 4u);
+        if (!idx) { free(arr); return ETAP_NOMEM; }
+        unpack_u32_bits(idx, dp + after, n_rows, bw);
+        for (uint32_t i = 0; i < n_rows; i++) {
+            if (idx[i] >= dict_n) { free(idx); free(arr); return ETAP_SCHEMA; }
+            memcpy(arr + i * width, dict + idx[i] * width, width);
+        }
+        free(idx);
+    } else if (d.codec == ETAP_CODEC_RLE) {
+        if (remain < 4) { free(arr); return ETAP_SCHEMA; }
+        uint32_t n_runs = 0;
+        memcpy(&n_runs, dp, 4);
+        uint32_t o = 4, row = 0;
+        for (uint32_t r = 0; r < n_runs; r++) {
+            if (o + width + 4 > remain) { free(arr); return ETAP_SCHEMA; }
+            uint32_t rl = 0;
+            memcpy(&rl, dp + o + width, 4);
+            if (row + rl > n_rows) { free(arr); return ETAP_SCHEMA; }
+            for (uint32_t k = 0; k < rl; k++, row++)
+                memcpy(arr + row * width, dp + o, width);
+            o += width + 4;
+        }
+        if (row != n_rows) { free(arr); return ETAP_SCHEMA; }
+    } else {
+        free(arr);
+        return ETAP_SCHEMA;
+    }
+
+    e->data = arr;
+    e->owned = 1;
     return ETAP_OK;
 }
 
 const etap_batch_hdr *etap_batch_header(const etap_batch *batch)
 {
-    return batch ? (const etap_batch_hdr *)batch->buf : NULL;
-}
-
-const etap_schema *etap_batch_schema(const etap_batch *batch)
-{
-    return batch ? &batch->schema : NULL;
-}
-
-const uint8_t *etap_batch_data(const etap_batch *batch, uint32_t *size)
-{
-    if (size) *size = batch ? batch->size : 0;
-    return batch ? batch->buf : NULL;
-}
-
-static const etap_section *sections_of(const etap_batch *b, uint16_t *n)
-{
-    const etap_batch_hdr *h = etap_batch_header(b);
-    if (!h) return NULL;
-    if (n) *n = h->n_sections;
-    return (const etap_section *)(b->buf + h->sections_off);
-}
-
-static const etap_section *find_sec(const etap_batch *b, uint16_t kind)
-{
-    uint16_t n = 0;
-    const etap_section *s = sections_of(b, &n);
-    if (!s) return NULL;
-    for (uint16_t i = 0; i < n; i++)
-        if (s[i].kind == kind) return &s[i];
-    return NULL;
-}
-
-const etap_parse_index_row *etap_parse_index(const etap_batch *batch, uint32_t *n)
-{
-    const etap_section *s = find_sec(batch, ETAP_SEC_PARSE_INDEX);
-    if (n) *n = s ? s->count : 0;
-    if (!s) return NULL;
-    return (const etap_parse_index_row *)(batch->buf + s->off);
-}
-
-const etap_flow_meta_row *etap_flow_meta(const etap_batch *batch, uint32_t *n)
-{
-    const etap_section *s = find_sec(batch, ETAP_SEC_FLOW_META);
-    if (n) *n = s ? s->count : 0;
-    if (!s) return NULL;
-    return (const etap_flow_meta_row *)(batch->buf + s->off);
+    return (batch && batch->hdr_ok) ? &batch->hdr : NULL;
 }
 
 etap_status etap_col(const etap_batch *batch, uint16_t section_kind, uint32_t col_id,
@@ -1513,50 +2083,140 @@ etap_status etap_col(const etap_batch *batch, uint16_t section_kind, uint32_t co
     if (data) *data = NULL;
     if (valid) *valid = NULL;
     if (offsets) *offsets = NULL;
-    const etap_section *s = find_sec(batch, section_kind);
-    if (!s || s->size < 8) return ETAP_SCHEMA;
-    const uint8_t *base = batch->buf + s->off;
-    uint16_t n_cols, flags;
-    uint32_t n_rows;
-    memcpy(&n_cols, base + 0, 2);
-    memcpy(&flags, base + 2, 2);
-    memcpy(&n_rows, base + 4, 4);
-    if (8u + 16u * n_cols > s->size) return ETAP_SCHEMA;
-    const etap_col_desc *d = (const etap_col_desc *)(base + 8);
-    const etap_col_desc *hit = NULL;
-    for (uint16_t i = 0; i < n_cols; i++)
-        if (d[i].col_id == col_id) { hit = &d[i]; break; }
-    if (!hit) return ETAP_INVALID;
-    if (type) *type = (etap_type)hit->type;
-    if (n) *n = n_rows;
-    const uint8_t *dp = base + hit->data_off;
-    uint32_t remain = hit->data_len;
-    if (hit->flags & 1) {
-        uint32_t vlen = align8((n_rows + 7u) / 8u);
-        if (remain < vlen) return ETAP_SCHEMA;
-        if (valid) *valid = dp;
-        dp += vlen;
-        remain -= vlen;
+    if (!batch || !batch->hdr_ok) return ETAP_INVALID;
+    etap_batch *mb = (etap_batch *)batch;
+    for (uint32_t i = 0; i < mb->n_cache; i++) {
+        if (mb->cache[i].section_kind == section_kind && mb->cache[i].col_id == col_id) {
+            col_cache_ent *e = &mb->cache[i];
+            if (type) *type = e->type;
+            if (n) *n = e->n;
+            if (data) *data = e->data;
+            if (valid) *valid = e->valid;
+            if (offsets) *offsets = e->offsets;
+            return ETAP_OK;
+        }
     }
-    if (hit->flags & 2) {
-        uint32_t offb = 4u * (n_rows + 1u);
-        if (remain < offb) return ETAP_SCHEMA;
-        if (offsets) *offsets = (const uint32_t *)dp;
-        dp += offb;
-        remain -= offb;
-        if (data) *data = dp;
-    } else {
-        if (data) *data = dp;
+    etap_section s;
+    if (!find_sec(batch, section_kind, &s)) return ETAP_SCHEMA;
+    if (mb->n_cache == mb->cap_cache) {
+        uint32_t nc = mb->cap_cache ? mb->cap_cache * 2u : 16u;
+        col_cache_ent *nb = (col_cache_ent *)realloc(mb->cache, nc * sizeof(*nb));
+        if (!nb) return ETAP_NOMEM;
+        mb->cache = nb;
+        mb->cap_cache = nc;
     }
-    (void)flags;
+    col_cache_ent e;
+    etap_status st = unpack_col(batch, &s, col_id, &e);
+    if (st != ETAP_OK) return st;
+    e.section_kind = section_kind;
+    e.col_id = col_id;
+    mb->cache[mb->n_cache++] = e;
+    if (type) *type = e.type;
+    if (n) *n = e.n;
+    if (data) *data = e.data;
+    if (valid) *valid = e.valid;
+    if (offsets) *offsets = e.offsets;
     return ETAP_OK;
+}
+
+const etap_parse_index_row *etap_parse_index(const etap_batch *batch, uint32_t *n)
+{
+    if (n) *n = 0;
+    if (!batch || !batch->hdr_ok) return NULL;
+    etap_batch *mb = (etap_batch *)batch;
+    if (mb->parse_ready) {
+        if (n) *n = mb->n_parse_rows;
+        return mb->parse_rows;
+    }
+    etap_section s;
+    if (!find_sec(batch, ETAP_SEC_PARSE_INDEX, &s) || s.count == 0) {
+        mb->parse_ready = 1;
+        mb->n_parse_rows = 0;
+        mb->parse_rows = NULL;
+        return NULL;
+    }
+    uint32_t nr = s.count;
+    etap_parse_index_row *rows = (etap_parse_index_row *)calloc(nr, sizeof(*rows));
+    if (!rows) return NULL;
+    etap_type t;
+    uint32_t n1 = 0;
+    const uint64_t *pkt = NULL, *msg = NULL;
+    const uint32_t *proto = NULL;
+    const uint16_t *moff = NULL, *mlen = NULL, *fl = NULL;
+    if (etap_col(batch, ETAP_SEC_PARSE_INDEX, ETAP_PCOL_PKT_ID, &t, &n1, (const void **)&pkt, NULL, NULL) == ETAP_OK && pkt)
+        for (uint32_t i = 0; i < nr && i < n1; i++) rows[i].pkt_id = pkt[i];
+    if (etap_col(batch, ETAP_SEC_PARSE_INDEX, ETAP_PCOL_MSG_ID, &t, &n1, (const void **)&msg, NULL, NULL) == ETAP_OK && msg)
+        for (uint32_t i = 0; i < nr && i < n1; i++) rows[i].msg_id = msg[i];
+    if (etap_col(batch, ETAP_SEC_PARSE_INDEX, ETAP_PCOL_PROTO_ID, &t, &n1, (const void **)&proto, NULL, NULL) == ETAP_OK && proto)
+        for (uint32_t i = 0; i < nr && i < n1; i++) rows[i].proto_id = proto[i];
+    if (etap_col(batch, ETAP_SEC_PARSE_INDEX, ETAP_PCOL_MSG_OFF, &t, &n1, (const void **)&moff, NULL, NULL) == ETAP_OK && moff)
+        for (uint32_t i = 0; i < nr && i < n1; i++) rows[i].msg_off = moff[i];
+    if (etap_col(batch, ETAP_SEC_PARSE_INDEX, ETAP_PCOL_MSG_LEN, &t, &n1, (const void **)&mlen, NULL, NULL) == ETAP_OK && mlen)
+        for (uint32_t i = 0; i < nr && i < n1; i++) rows[i].msg_len = mlen[i];
+    if (etap_col(batch, ETAP_SEC_PARSE_INDEX, ETAP_PCOL_FLAGS, &t, &n1, (const void **)&fl, NULL, NULL) == ETAP_OK && fl)
+        for (uint32_t i = 0; i < nr && i < n1; i++) rows[i].flags = fl[i];
+    mb->parse_rows = rows;
+    mb->n_parse_rows = nr;
+    mb->parse_ready = 1;
+    if (n) *n = nr;
+    return rows;
+}
+
+const etap_flow_meta_row *etap_flow_meta(const etap_batch *batch, uint32_t *n)
+{
+    if (n) *n = 0;
+    if (!batch || !batch->hdr_ok) return NULL;
+    etap_batch *mb = (etap_batch *)batch;
+    if (mb->flow_ready) {
+        if (n) *n = mb->n_flow_rows;
+        return mb->flow_rows;
+    }
+    etap_section s;
+    if (!find_sec(batch, ETAP_SEC_FLOW_META, &s) || s.count == 0) {
+        mb->flow_ready = 1;
+        mb->n_flow_rows = 0;
+        mb->flow_rows = NULL;
+        return NULL;
+    }
+    uint32_t nr = s.count;
+    etap_flow_meta_row *rows = (etap_flow_meta_row *)calloc(nr, sizeof(*rows));
+    if (!rows) return NULL;
+    etap_type t;
+    uint32_t n1 = 0;
+    const uint64_t *fid = NULL, *t0 = NULL, *t1 = NULL, *p0 = NULL, *p1 = NULL;
+    const uint8_t *ev = NULL, *st = NULL;
+    const uint16_t *fl = NULL;
+    const uint32_t *ifx = NULL;
+    if (etap_col(batch, ETAP_SEC_FLOW_META, ETAP_FCOL_FLOW_ID, &t, &n1, (const void **)&fid, NULL, NULL) == ETAP_OK && fid)
+        for (uint32_t i = 0; i < nr && i < n1; i++) rows[i].flow_id = fid[i];
+    if (etap_col(batch, ETAP_SEC_FLOW_META, ETAP_FCOL_EVENT, &t, &n1, (const void **)&ev, NULL, NULL) == ETAP_OK && ev)
+        for (uint32_t i = 0; i < nr && i < n1; i++) rows[i].event = ev[i];
+    if (etap_col(batch, ETAP_SEC_FLOW_META, ETAP_FCOL_STATE, &t, &n1, (const void **)&st, NULL, NULL) == ETAP_OK && st)
+        for (uint32_t i = 0; i < nr && i < n1; i++) rows[i].state = st[i];
+    if (etap_col(batch, ETAP_SEC_FLOW_META, ETAP_FCOL_FLAGS, &t, &n1, (const void **)&fl, NULL, NULL) == ETAP_OK && fl)
+        for (uint32_t i = 0; i < nr && i < n1; i++) rows[i].flags = fl[i];
+    if (etap_col(batch, ETAP_SEC_FLOW_META, ETAP_FCOL_IFINDEX, &t, &n1, (const void **)&ifx, NULL, NULL) == ETAP_OK && ifx)
+        for (uint32_t i = 0; i < nr && i < n1; i++) rows[i].ifindex = ifx[i];
+    if (etap_col(batch, ETAP_SEC_FLOW_META, ETAP_FCOL_START_NS, &t, &n1, (const void **)&t0, NULL, NULL) == ETAP_OK && t0)
+        for (uint32_t i = 0; i < nr && i < n1; i++) rows[i].start_ns = t0[i];
+    if (etap_col(batch, ETAP_SEC_FLOW_META, ETAP_FCOL_LAST_NS, &t, &n1, (const void **)&t1, NULL, NULL) == ETAP_OK && t1)
+        for (uint32_t i = 0; i < nr && i < n1; i++) rows[i].last_ns = t1[i];
+    if (etap_col(batch, ETAP_SEC_FLOW_META, ETAP_FCOL_PKT_ID_FIRST, &t, &n1, (const void **)&p0, NULL, NULL) == ETAP_OK && p0)
+        for (uint32_t i = 0; i < nr && i < n1; i++) rows[i].pkt_id_first = p0[i];
+    if (etap_col(batch, ETAP_SEC_FLOW_META, ETAP_FCOL_PKT_ID_LAST, &t, &n1, (const void **)&p1, NULL, NULL) == ETAP_OK && p1)
+        for (uint32_t i = 0; i < nr && i < n1; i++) rows[i].pkt_id_last = p1[i];
+    mb->flow_rows = rows;
+    mb->n_flow_rows = nr;
+    mb->flow_ready = 1;
+    if (n) *n = nr;
+    return rows;
 }
 
 etap_span etap_packet_bytes(const etap_batch *batch, uint32_t index)
 {
     etap_span sp = { NULL, 0 };
-    const etap_section *bytes = find_sec(batch, ETAP_SEC_PACKET_BYTES);
-    if (!bytes) return sp;
+    etap_section bytes;
+    if (!find_sec(batch, ETAP_SEC_PACKET_BYTES, &bytes)) return sp;
     etap_type t;
     uint32_t n = 0;
     const void *offp = NULL, *lenp = NULL;
@@ -1567,10 +2227,21 @@ etap_span etap_packet_bytes(const etap_batch *batch, uint32_t index)
     if (index >= n) return sp;
     uint32_t off = ((const uint32_t *)offp)[index];
     uint32_t len = ((const uint32_t *)lenp)[index];
-    if (off + len > bytes->size) return sp;
-    sp.data = batch->buf + bytes->off + off;
+    if ((uint64_t)off + len > bytes.size) return sp;
+    sp.data = batch->buf + bytes.off + off;
     sp.len = len;
     return sp;
+}
+
+const etap_schema *etap_batch_schema(const etap_batch *batch)
+{
+    return batch ? &batch->schema : NULL;
+}
+
+const uint8_t *etap_batch_data(const etap_batch *batch, uint32_t *size)
+{
+    if (size) *size = batch ? batch->size : 0;
+    return batch ? batch->buf : NULL;
 }
 
 etap_status etap_stats(etap_sub *sub, etap_sub_stats *out)

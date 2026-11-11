@@ -1,6 +1,6 @@
 # ETAP：面向机器的以太网流量感知端口
 
-版本 0.1（草案）  
+版本 0.2（草案）  
 字节序：除另行说明外，均为小端。  
 数据通路禁止使用 JSON、日志或自然语言作为模型输入。字符串只出现在一次性能力目录和人类调试接口中。
 
@@ -103,8 +103,8 @@ etap_status etap_stats(etap_sub *sub, etap_sub_stats *out);
 
 | 偏移 | 字段 | 类型 | 含义 |
 | --- | --- | --- | --- |
-| 0 | `magic` | u32 | `0x31504154`（「TAP1」） |
-| 4 | `version` | u16 | 协议版本，当前 `0x0001` |
+| 0 | `magic` | u32 | `0x32504154`（「TAP2」） |
+| 4 | `version` | u16 | 协议版本，当前 `0x0002` |
 | 6 | `hdr_len` | u16 | 头长度 |
 | 8 | `flags` | u32 | 见下表 |
 | 12 | `port_id` | u32 | |
@@ -241,13 +241,17 @@ etap_status etap_stats(etap_sub *sub, etap_sub_stats *out);
 
 核心对象是 `etap_batch`。一个批次可组合三种视图，未订阅的节段不出现。报文字节放在连续缓冲区中；解析结果和流特征使用有类型的列式数组；变长内容用 `(offset, length)` 引用堆区。批次自带或引用机器可读 schema，适配层据此映射输入。
 
-### 7.1 批次头（128 字节）
+### 7.1 批次头（紧凑前缀 92 字节；有缺口时再附 32 字节）
+
+本机共享内存、远端传输和 API 返回的原始缓冲共用同一套紧凑字节布局。`etap_batch_header()` 返回的是*解码后*的头：始终包含 `gap_*` 字段（未置 `HAS_GAP` 时为 0）。解码结构体的大小不必等于 `hdr_len`；遍历原始缓冲时必须以 `hdr_len` 为准。
+
+固定前缀 92 字节：
 
 | 偏移 | 字段 | 类型 | 含义 |
 | --- | --- | --- | --- |
-| 0 | `magic` | u32 | `0x31504154` |
-| 4 | `version` | u16 | `0x0001` |
-| 6 | `hdr_len` | u16 | `128` |
+| 0 | `magic` | u32 | `0x32504154`（「TAP2」） |
+| 4 | `version` | u16 | `0x0002` |
+| 6 | `hdr_len` | u16 | `92`，若置了 `HAS_GAP` 则为 `124` |
 | 8 | `flags` | u32 | 批次级标记，见第 9 节 |
 | 12 | `n_sections` | u16 | |
 | 14 | `clock` | u8 | |
@@ -262,17 +266,21 @@ etap_status etap_stats(etap_sub *sub, etap_sub_stats *out);
 | 64 | `n_packets` | u32 | 报文视图行数 |
 | 68 | `n_parse_rows` | u32 | 解析视图行数 |
 | 72 | `n_flows` | u32 | 流视图行数 |
-| 76 | `reserved1` | u32 | |
-| 80 | `gap_dropped_pkts` | u64 | 自上一成功交付批次以来丢掉的报文数 |
-| 88 | `gap_dropped_bytes` | u64 | 对应的线长合计 |
-| 96 | `gap_first_pkt_id` | u64 | 缺口区间的下界（含）。无缺口为 0 |
-| 104 | `gap_last_pkt_id` | u64 | 缺口区间的上界（含）。无缺口为 0 |
-| 112 | `producer_lag_us` | u32 | 采集到入批的滞后估计 |
-| 116 | `crc32c` | u32 | 覆盖头和节目录；`0` 表示未计算 |
-| 120 | `sections_off` | u32 | 相对批次起始 |
-| 124 | `total_size` | u32 | 含头的总字节 |
+| 76 | `producer_lag_us` | u32 | 采集到入批的滞后估计 |
+| 80 | `crc32c` | u32 | 若计算，则覆盖整批且该字段本身按 0 计；`0` 表示未计算 |
+| 84 | `sections_off` | u32 | 相对批次起始，等于 `hdr_len`（节目录紧随批次头） |
+| 88 | `total_size` | u32 | 含头的总字节 |
 
-节目录在 `sections_off`，每项 24 字节：`kind u16`，`flags u16`，`count u32`，`off u64`，`size u64`。`off` 相对批次起始，8 字节对齐。
+若 `flags` 置了 `HAS_GAP`，在 92 字节前缀之后立即附加 32 字节缺口块（计入 `hdr_len = 124`），不得在无缺口时写全 0 占位：
+
+| 偏移 | 字段 | 类型 | 含义 |
+| --- | --- | --- | --- |
+| 92 | `gap_dropped_pkts` | u64 | 自上一成功交付批次以来丢掉的报文数 |
+| 100 | `gap_dropped_bytes` | u64 | 对应的线长合计 |
+| 108 | `gap_first_pkt_id` | u64 | 缺口区间的下界（含） |
+| 116 | `gap_last_pkt_id` | u64 | 缺口区间的上界（含） |
+
+节目录在 `sections_off`（即 `hdr_len`），每项 14 字节，项与项之间无 8 字节填充：`kind u8`，`flags u8`，`count u32`，`off u32`，`size u32`。`off` 相对批次起始。节载荷从 4 字节对齐处开始（最多 3 个填充字节）。不要按 8 字节对齐每一列或每一个报文。
 
 ### 7.2 节类型
 
@@ -291,21 +299,43 @@ etap_status etap_stats(etap_sub *sub, etap_sub_stats *out);
 
 ### 7.3 列组编码
 
-`PACKET_META`、`PARSE_COLS`、`FLOW_FEAT` 使用相同的列组前缀：
+`PACKET_META`、`PARSE_COLS`、`FLOW_FEAT`，以及 `PARSE_INDEX` 和 `FLOW_META`，使用相同的列组前缀。行数取自节目录的 `count`，列组头中不再重复存放 `n_rows`。
 
 | 字段 | 类型 | 含义 |
 | --- | --- | --- |
 | `n_cols` | u16 | |
-| `n_rows` | u32 | 与节 `count` 一致 |
 | `flags` | u16 | bit0 含空值位图 |
 | 随后 `n_cols` 个列描述 | 16 字节 | 见下 |
-| 随后列数据，每列 8 字节对齐 |  | |
+| 随后列数据，紧密排列 |  | |
 
-列描述：`col_id u32`（报文元数据为固定编号 1–11，解析为 `field_id`，流为 `feature_id`），`type u16`，`flags u16`（bit0 有 validity，bit1 变长），`data_off u32`，`data_len u32`（均相对本列组起始）。
+列描述 16 字节：`col_id u32`（报文元数据为固定编号 1–12，解析字段为 `field_id`，流特征为 `feature_id`；`PARSE_INDEX` / `FLOW_META` 使用本节局部编号，见 7.5 / 7.6），`type u8`，`codec u8`（见下），`bit_width u8`（打包时为 1–32，否则为 0），`flags u8`（bit0 有 validity，bit1 变长），`data_off u32`，`data_len u32`（均相对本列组起始；打包字的 `data_off` 为 4 字节对齐）。
 
-定长列：`n_rows * width` 个紧密元素。  
-变长列：`u32 offsets[n_rows+1]`，内容在 `HEAP` 或本列 `data` 区，区间为 `[offsets[i], offsets[i+1])`。  
-空值位图：行 `i` 的第 `i` 位为 0 表示该字段缺失。位图按 bit little-endian 打包，长度 `ceil(n_rows/8)`，再补齐到 8 字节。缺失不得用 0、空串或 `N/A` 填充后让模型当成有效值。
+若存在 validity，位图长 `ceil(n_rows/8)` 字节，放在该列 `data` 区的末尾，并计入 `data_len`。不再补齐到 8 字节。行 `i` 的第 `i` 位为 0 表示该字段缺失（bit little-endian）。缺失不得用 0、空串或 `N/A` 填充后让模型当成有效值。
+
+变长列：紧密的 `u32 offsets[n_rows+1]`，内容在 `HEAP` 或本列 `data` 区（validity 之前），区间为 `[offsets[i], offsets[i+1])`。
+
+定长整数列按下列编码写入（不做 Huffman / ANS / zstd / lz4 等熵编码）。编解码都是移位和掩码。比特打包规则：小端 32 位字，值从 LSB 填到 MSB，最后一词未用的高位为 0；`word_count = (n * bit_width + 31) / 32`；`bit_width` 为 1–32。若残差无法放入 32 位，回退为 `RAW`。
+
+| `codec` | 名称 | 载荷 |
+| --- | --- | --- |
+| 0 | `RAW` | 逻辑宽度的紧密数组 |
+| 1 | `CONST` | 一个逻辑宽度的值 |
+| 2 | `FOR` | 先放逻辑宽度的基数（`u64` / `ts_ns` / `dur_ns` 为 8 字节），再打包 `(value - base)` |
+| 3 | `DELTA` | 先放逻辑宽度的首个值，再打包 zigzag 有符号差分。zigzag：`(d << 1) ^ (d >> 63)`，`d` 为 `int64_t` |
+| 4 | `DICT` | `u16 dict_n`，再 4 字节对齐后存放 `dict_n` 个逻辑宽度的字典值，然后打包下标 |
+| 5 | `RLE` | `u32 n_runs`，随后 `n_runs` 组 `(逻辑宽度的值, u32 run_len)` |
+
+定宽整数列的编码选择是确定的：
+
+1. `n == 0` → 空的 `RAW`
+2. 全部相等 → `CONST`
+3. 对 `U64` / `TS_NS` / `DUR_NS` / 类似偏移的 `U32` 列（如 `bytes_off`），尝试 `DELTA`；若打包后小于 `RAW` 则采用
+4. 尝试 `FOR`；若更小则采用
+5. 若不同值个数 `<= n/2` 且 `<= 256`，且打包后更小，则采用 `DICT`
+6. 若游程数 `<= n/4` 且打包后更小，则采用 `RLE`
+7. 否则 `RAW`
+
+`etap_col` 在首次访问某列时，将其解包到该批次的暂存缓存（逻辑宽度数组 + validity），并返回该指针；同一列的再次调用复用缓存。不必把整批提前展开。
 
 ### 7.4 报文视图
 
@@ -325,21 +355,22 @@ etap_status etap_stats(etap_sub *sub, etap_sub_stats *out);
 | 10 | `l4_off` | u16 | |
 | 11 | `bytes_off` / `bytes_len` | u32, u32 | 在 `PACKET_BYTES` 中的位置与长度 |
 
-`PACKET_BYTES` 是连续缓冲，报文按 8 字节对齐依次放置。只包含订阅的字节区间，不是完整镜像。`cap_len < wire_len` 或 `flags.TRUNCATED` 表示截断。`bytes_mode=0` 时无此节，模型仍可仅用长度与时间工作。
+`PACKET_BYTES` 是订阅切片的紧密拼接，不再对每个报文做 8 字节对齐填充。边界由 `BYTES_OFF` / `BYTES_LEN` 给出。只包含订阅的字节区间，不是完整镜像。`cap_len < wire_len` 或 `flags.TRUNCATED` 表示截断。`bytes_mode=0` 时无此节，模型仍可仅用长度与时间工作。
 
 ### 7.5 解析视图
 
-`PARSE_INDEX` 每行 32 字节：
+`PARSE_INDEX` 在线上是列组，不再使用带保留字段的 32 字节行。本节局部列编号（不是新的观察语义）为：
 
-| 字段 | 类型 | 含义 |
-| --- | --- | --- |
-| `pkt_id` | u64 | 来源报文 |
-| `msg_id` | u64 | 消息标识 |
-| `proto_id` | u32 | |
-| `msg_off` | u16 | 消息相对该包字节缓冲的起始 |
-| `msg_len` | u16 | 消息长度 |
-| `flags` | u16 | 含 `PARSE_INCOMPLETE`、`PARSE_ERROR` |
-| `reserved` | u16 | |
+| col_id | 名称 | 类型 | 含义 |
+| --- | --- | --- | --- |
+| 1 | `pkt_id` | u64 | 来源报文 |
+| 2 | `msg_id` | u64 | 消息标识 |
+| 3 | `proto_id` | u32 | |
+| 4 | `msg_off` | u16 | 消息相对该包字节缓冲的起始 |
+| 5 | `msg_len` | u16 | 消息长度 |
+| 6 | `flags` | u16 | 含 `PARSE_INCOMPLETE`、`PARSE_ERROR` |
+
+`etap_parse_index()` 可物化去掉保留字段后的行数组（26 字节/行），便于已有调用方读取。
 
 `PARSE_COLS` 与 `PARSE_INDEX` 行对齐（同一 `n_rows`、同一顺序）。若订阅了字段偏移，则为每个变长或需要定位的字段额外提供并行列：`field_off u16`、`field_len u16`（相对该包字节缓冲；字段缺失则 validity=0）。这样模型既使用类型化字段值，也能回到原始字节。
 
@@ -347,19 +378,21 @@ etap_status etap_stats(etap_sub *sub, etap_sub_stats *out);
 
 ### 7.6 流视图
 
-`FLOW_META` 每行 48 字节：
+`FLOW_META` 在线上是列组，不再以 48 字节行作为内存/线上布局。本节局部列编号为：
 
-| 字段 | 类型 | 含义 |
-| --- | --- | --- |
-| `flow_id` | u64 | |
-| `event` | u8 | 1 New，2 Update，3 Expire，4 Reset，5 Anomaly |
-| `state` | u8 | 1 尝试，2 已建立，3 关闭中，4 已结束，5 异常 |
-| `flags` | u16 | |
-| `ifindex` | u32 | |
-| `start_ns` | u64 | 流开始 |
-| `last_ns` | u64 | 本事件对应的最后观察时间 |
-| `pkt_id_first` | u64 | 该流在 epoch 内首个已观察 `pkt_id`（可能早于本批次；若未知且有缺口，置 0 并置 `GAP`） |
-| `pkt_id_last` | u64 | 截至本事件的最后 `pkt_id` |
+| col_id | 名称 | 类型 | 含义 |
+| --- | --- | --- | --- |
+| 1 | `flow_id` | u64 | |
+| 2 | `event` | u8 | 1 New，2 Update，3 Expire，4 Reset，5 Anomaly |
+| 3 | `state` | u8 | 1 尝试，2 已建立，3 关闭中，4 已结束，5 异常 |
+| 4 | `flags` | u16 | |
+| 5 | `ifindex` | u32 | |
+| 6 | `start_ns` | u64 | 流开始 |
+| 7 | `last_ns` | u64 | 本事件对应的最后观察时间 |
+| 8 | `pkt_id_first` | u64 | 该流在 epoch 内首个已观察 `pkt_id`（可能早于本批次；若未知且有缺口，置 0 并置 `GAP`） |
+| 9 | `pkt_id_last` | u64 | 截至本事件的最后 `pkt_id` |
+
+`etap_flow_meta()` 仍可物化 48 字节的 `etap_flow_meta_row`，仅作为 API 便利结构，不是线上布局。
 
 `FLOW_FEAT` 与 `FLOW_META` 行对齐。推荐但并非强制的特征 ID 空间（平台目录为准）：
 
@@ -493,7 +526,7 @@ Arena
 
 `etap_poll` 将槽位从 `READY` 转为 `LEASED` 并返回零拷贝指针。`etap_release` 将其置回 `EMPTY`。生产者发现无空槽时不得阻塞采集：按订阅执行采样、聚合或丢弃，并增加 `drop_*`，下一成功批次必须带缺口标记。
 
-本机与远端的批次字节布局相同，便于同一适配层处理。
+本机与远端的批次字节布局相同，都是本节描述的 v0.2 紧凑布局，便于同一适配层处理。
 
 ---
 

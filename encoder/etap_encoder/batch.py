@@ -109,26 +109,26 @@ class EtapBatchHdr(ctypes.Structure):
         ("n_packets", ctypes.c_uint32),
         ("n_parse_rows", ctypes.c_uint32),
         ("n_flows", ctypes.c_uint32),
-        ("reserved1", ctypes.c_uint32),
-        ("gap_dropped_pkts", ctypes.c_uint64),
-        ("gap_dropped_bytes", ctypes.c_uint64),
-        ("gap_first_pkt_id", ctypes.c_uint64),
-        ("gap_last_pkt_id", ctypes.c_uint64),
         ("producer_lag_us", ctypes.c_uint32),
         ("crc32c", ctypes.c_uint32),
         ("sections_off", ctypes.c_uint32),
         ("total_size", ctypes.c_uint32),
+        # Decoded header always includes gap fields (zero when HAS_GAP is clear).
+        ("gap_dropped_pkts", ctypes.c_uint64),
+        ("gap_dropped_bytes", ctypes.c_uint64),
+        ("gap_first_pkt_id", ctypes.c_uint64),
+        ("gap_last_pkt_id", ctypes.c_uint64),
     ]
 
 
 class EtapSection(ctypes.Structure):
     _pack_ = 1
     _fields_ = [
-        ("kind", ctypes.c_uint16),
-        ("flags", ctypes.c_uint16),
+        ("kind", ctypes.c_uint8),
+        ("flags", ctypes.c_uint8),
         ("count", ctypes.c_uint32),
-        ("off", ctypes.c_uint64),
-        ("size", ctypes.c_uint64),
+        ("off", ctypes.c_uint32),
+        ("size", ctypes.c_uint32),
     ]
 
 
@@ -562,7 +562,7 @@ def copy_batch(lib, batch_ptr) -> EtapBatch:
     idx_ptr = lib.etap_parse_index(batch_ptr, ctypes.byref(nidx))
     n_idx = int(nidx.value)
     if idx_ptr and n_idx:
-        raw = ctypes.string_at(idx_ptr, n_idx * 32)
+        raw = ctypes.string_at(idx_ptr, n_idx * np.dtype(C.PARSE_INDEX_DTYPE).itemsize)
         rows = np.frombuffer(raw, dtype=np.dtype(C.PARSE_INDEX_DTYPE)).copy()
         p_pkt = rows["pkt_id"]
         p_msg = rows["msg_id"]

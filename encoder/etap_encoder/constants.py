@@ -15,9 +15,11 @@ QWEN35_2B_BASE = "Qwen/Qwen3.5-2B-Base"
 QWEN35_2B_VOCAB = 248320
 QWEN35_2B_LAYERS = 24
 
-ETAP_VERSION = 0x0001
-ETAP_MAGIC = 0x31504154
-ETAP_BATCH_HDR_LEN = 128
+ETAP_VERSION = 0x0002
+ETAP_MAGIC = 0x32504154  # "TAP2" little-endian
+ETAP_BATCH_HDR_PREFIX_LEN = 92
+ETAP_BATCH_HDR_GAP_LEN = 124
+ETAP_SECTION_LEN = 14
 
 # etap_status
 ETAP_OK = 0
@@ -178,9 +180,32 @@ PARSE_INDEX_DTYPE = [
     ("msg_off", "<u2"),
     ("msg_len", "<u2"),
     ("flags", "<u2"),
-    ("reserved", "<u2"),
-    ("reserved2", "<u4"),
 ]
+
+# Packed column codecs (mirrored from etap.h; the adapter uses etap_col, not these directly)
+ETAP_CODEC_RAW = 0
+ETAP_CODEC_CONST = 1
+ETAP_CODEC_FOR = 2
+ETAP_CODEC_DELTA = 3
+ETAP_CODEC_DICT = 4
+ETAP_CODEC_RLE = 5
+
+ETAP_PCOL_PKT_ID = 1
+ETAP_PCOL_MSG_ID = 2
+ETAP_PCOL_PROTO_ID = 3
+ETAP_PCOL_MSG_OFF = 4
+ETAP_PCOL_MSG_LEN = 5
+ETAP_PCOL_FLAGS = 6
+
+ETAP_FCOL_FLOW_ID = 1
+ETAP_FCOL_EVENT = 2
+ETAP_FCOL_STATE = 3
+ETAP_FCOL_FLAGS = 4
+ETAP_FCOL_IFINDEX = 5
+ETAP_FCOL_START_NS = 6
+ETAP_FCOL_LAST_NS = 7
+ETAP_FCOL_PKT_ID_FIRST = 8
+ETAP_FCOL_PKT_ID_LAST = 9
 
 FLOW_META_DTYPE = [
     ("flow_id", "<u8"),

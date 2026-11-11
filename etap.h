@@ -1,5 +1,6 @@
-/* ETAP v0.1 — Ethernet Traffic Awareness Port
+/* ETAP v0.2 — Ethernet Traffic Awareness Port
  * Machine-facing binary API. The data path does not use JSON or text logs.
+ * Local, shared-memory, and remote paths share one compact batch layout.
  */
 #ifndef ETAP_H
 #define ETAP_H
@@ -11,9 +12,12 @@
 extern "C" {
 #endif
 
-#define ETAP_VERSION        0x0001u
-#define ETAP_MAGIC          0x31504154u  /* "TAP1" little-endian */
-#define ETAP_BATCH_HDR_LEN  128u
+#define ETAP_VERSION                 0x0002u
+#define ETAP_MAGIC                   0x32504154u  /* "TAP2" little-endian */
+#define ETAP_BATCH_HDR_PREFIX_LEN    92u
+#define ETAP_BATCH_GAP_BLOCK_LEN     32u
+#define ETAP_BATCH_HDR_GAP_LEN       124u         /* prefix + optional gap block */
+#define ETAP_SECTION_LEN             14u
 
 typedef enum etap_status {
     ETAP_OK            = 0,
@@ -126,6 +130,29 @@ enum {
 #define ETAP_FEAT_BYTES_REV 4u
 #define ETAP_FEAT_DURATION  5u
 
+/* PARSE_INDEX column IDs (local to that section; not new observation fields). */
+enum {
+    ETAP_PCOL_PKT_ID   = 1,
+    ETAP_PCOL_MSG_ID   = 2,
+    ETAP_PCOL_PROTO_ID = 3,
+    ETAP_PCOL_MSG_OFF  = 4,
+    ETAP_PCOL_MSG_LEN  = 5,
+    ETAP_PCOL_FLAGS    = 6
+};
+
+/* FLOW_META column IDs (local to that section; not new observation fields). */
+enum {
+    ETAP_FCOL_FLOW_ID      = 1,
+    ETAP_FCOL_EVENT        = 2,
+    ETAP_FCOL_STATE        = 3,
+    ETAP_FCOL_FLAGS        = 4,
+    ETAP_FCOL_IFINDEX      = 5,
+    ETAP_FCOL_START_NS     = 6,
+    ETAP_FCOL_LAST_NS      = 7,
+    ETAP_FCOL_PKT_ID_FIRST = 8,
+    ETAP_FCOL_PKT_ID_LAST  = 9
+};
+
 enum {
     ETAP_META_PKT_ID    = 1u << 0,
     ETAP_META_FLOW_ID   = 1u << 1,
@@ -197,6 +224,21 @@ enum {
     ETAP_FRM_STATS_REQ       = 11,
     ETAP_FRM_STATS_RSP       = 12,
     ETAP_FRM_HEARTBEAT       = 13
+};
+
+/* Column codecs. No entropy coding (no Huffman/ANS/zstd/lz4). */
+enum {
+    ETAP_CODEC_RAW   = 0, /* native-width tight array */
+    ETAP_CODEC_CONST = 1, /* a single value of the logical type width */
+    ETAP_CODEC_FOR   = 2, /* base at logical width, then (value-base) packed */
+    ETAP_CODEC_DELTA = 3, /* first value at native width, then zigzag deltas packed */
+    ETAP_CODEC_DICT  = 4, /* u16 dict_n, 4-aligned dict values, packed indices */
+    ETAP_CODEC_RLE   = 5  /* u32 n_runs, then (native-width value, u32 run_len) */
+};
+
+enum {
+    ETAP_COLF_VALIDITY = 1u << 0,
+    ETAP_COLF_VARLEN   = 1u << 1
 };
 
 #pragma pack(push, 1)
@@ -301,6 +343,10 @@ typedef struct etap_sub_ack {
     uint32_t effective_max_wait_us;
 } etap_sub_ack;
 
+/* Decoded batch header. Always includes gap fields (zero when HAS_GAP is
+ * clear). This struct is not the on-wire layout: the wire prefix is 92 bytes
+ * and the 32-byte gap block is appended only when HAS_GAP is set (hdr_len=124).
+ * Callers must use hdr_len when walking the raw buffer. */
 typedef struct etap_batch_hdr {
     uint32_t magic;
     uint16_t version;
@@ -319,33 +365,36 @@ typedef struct etap_batch_hdr {
     uint32_t n_packets;
     uint32_t n_parse_rows;
     uint32_t n_flows;
-    uint32_t reserved1;
-    uint64_t gap_dropped_pkts;
-    uint64_t gap_dropped_bytes;
-    uint64_t gap_first_pkt_id;
-    uint64_t gap_last_pkt_id;
     uint32_t producer_lag_us;
     uint32_t crc32c;
     uint32_t sections_off;
     uint32_t total_size;
+    uint64_t gap_dropped_pkts;
+    uint64_t gap_dropped_bytes;
+    uint64_t gap_first_pkt_id;
+    uint64_t gap_last_pkt_id;
 } etap_batch_hdr;
 
+/* Packed 14-byte on-wire section directory entry. */
 typedef struct etap_section {
-    uint16_t kind;
-    uint16_t flags;
+    uint8_t  kind;
+    uint8_t  flags;
     uint32_t count;
-    uint64_t off;
-    uint64_t size;
+    uint32_t off;   /* relative to batch start */
+    uint32_t size;
 } etap_section;
 
 typedef struct etap_col_desc {
     uint32_t col_id;
-    uint16_t type;
-    uint16_t flags;
-    uint32_t data_off;
+    uint8_t  type;      /* etap_type */
+    uint8_t  codec;     /* ETAP_CODEC_* */
+    uint8_t  bit_width; /* 1..32 when packed; 0 otherwise */
+    uint8_t  flags;     /* bit0 = validity bitmap, bit1 = varlen */
+    uint32_t data_off;  /* relative to this colgroup start; 4-byte aligned for packed words */
     uint32_t data_len;
 } etap_col_desc;
 
+/* Materialized parse-index row (API convenience). Not the on-wire layout. */
 typedef struct etap_parse_index_row {
     uint64_t pkt_id;
     uint64_t msg_id;
@@ -353,10 +402,9 @@ typedef struct etap_parse_index_row {
     uint16_t msg_off;
     uint16_t msg_len;
     uint16_t flags;
-    uint16_t reserved;
-    uint32_t reserved2; /* pad to 32-byte row */
 } etap_parse_index_row;
 
+/* Materialized flow-meta row (API convenience, 48 bytes). Not the on-wire layout. */
 typedef struct etap_flow_meta_row {
     uint64_t flow_id;
     uint8_t  event;
@@ -396,9 +444,13 @@ typedef struct etap_sub_stats {
 
 #pragma pack(pop)
 
-_Static_assert(sizeof(etap_batch_hdr) == 128, "etap_batch_hdr must be 128 bytes");
-_Static_assert(sizeof(etap_section) == 24, "etap_section must be 24 bytes");
-_Static_assert(sizeof(etap_parse_index_row) == 32, "parse index row must be 32 bytes");
+_Static_assert(offsetof(etap_batch_hdr, gap_dropped_pkts) == 92,
+               "on-wire batch header prefix must be 92 bytes");
+_Static_assert(sizeof(etap_batch_hdr) == 124,
+               "decoded etap_batch_hdr includes gap fields (124 bytes)");
+_Static_assert(sizeof(etap_section) == 14, "etap_section must be 14 bytes");
+_Static_assert(sizeof(etap_col_desc) == 16, "etap_col_desc must be 16 bytes");
+_Static_assert(sizeof(etap_parse_index_row) == 26, "parse index row must be 26 bytes");
 _Static_assert(sizeof(etap_flow_meta_row) == 48, "flow meta row must be 48 bytes");
 
 typedef struct etap_conn  etap_conn;
@@ -427,8 +479,12 @@ etap_status etap_unsubscribe(etap_sub *sub);
 etap_status etap_poll(etap_sub *sub, uint32_t timeout_us, etap_batch **out);
 etap_status etap_release(etap_batch *batch);
 
+/* Returns a decoded header (always includes gap fields). Not a raw overlay. */
 const etap_batch_hdr *etap_batch_header(const etap_batch *batch);
 const etap_schema    *etap_batch_schema(const etap_batch *batch);
+
+/* Copy the i-th packed 14-byte section directory entry. */
+etap_status etap_batch_section(const etap_batch *batch, uint16_t index, etap_section *out);
 
 etap_status etap_col(const etap_batch *batch, uint16_t section_kind, uint32_t col_id,
                      etap_type *type, uint32_t *n,

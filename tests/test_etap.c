@@ -121,10 +121,116 @@ static int catalog_has_name(const etap_caps *caps, uint32_t field_id, const char
 static int section_present(const etap_batch *b, uint16_t kind)
 {
     const etap_batch_hdr *h = etap_batch_header(b);
-    const etap_section *s = (const etap_section *)(etap_batch_data(b, NULL) + h->sections_off);
-    for (uint16_t i = 0; i < h->n_sections; i++)
-        if (s[i].kind == kind) return 1;
+    if (!h) return 0;
+    for (uint16_t i = 0; i < h->n_sections; i++) {
+        etap_section s;
+        if (etap_batch_section(b, i, &s) == ETAP_OK && s.kind == kind) return 1;
+    }
     return 0;
+}
+
+static uint32_t align8_u(uint32_t x) { return (x + 7u) & ~7u; }
+
+/* Conservative v0.1 (TAP1) size of the same logical content: 128-byte header,
+ * 24-byte section entries, 8-byte-aligned packet slices, native-width columns,
+ * 32-byte parse-index rows and 48-byte flow-meta rows. */
+static uint32_t v01_equivalent_size(const etap_batch *b)
+{
+    const etap_batch_hdr *h = etap_batch_header(b);
+    uint32_t np = h->n_parse_rows, nf = h->n_flows;
+    uint32_t sz = 128u + 24u * h->n_sections;
+
+    etap_type t;
+    uint32_t nc = 0;
+    const uint32_t *blen = NULL;
+    if (etap_col(b, ETAP_SEC_PACKET_META, ETAP_COL_BYTES_LEN, &t, &nc, (const void **)&blen, NULL, NULL) == ETAP_OK && blen) {
+        uint32_t bytes = 0;
+        for (uint32_t i = 0; i < nc; i++) {
+            bytes = align8_u(bytes);
+            bytes += blen[i];
+        }
+        bytes = align8_u(bytes);
+        sz += bytes;
+    }
+
+    /* Packet meta columns at native width, each 8-byte padded. */
+    struct { uint32_t id; uint32_t width; } pcols[] = {
+        { ETAP_COL_PKT_ID, 8 }, { ETAP_COL_FLOW_ID, 8 }, { ETAP_COL_TS_NS, 8 },
+        { ETAP_COL_WIRE_LEN, 4 }, { ETAP_COL_CAP_LEN, 4 }, { ETAP_COL_DIR, 1 },
+        { ETAP_COL_IFINDEX, 4 }, { ETAP_COL_FLAGS, 2 }, { ETAP_COL_L3_OFF, 2 },
+        { ETAP_COL_L4_OFF, 2 }, { ETAP_COL_BYTES_OFF, 4 }, { ETAP_COL_BYTES_LEN, 4 }
+    };
+    uint32_t meta_cols = 0;
+    uint32_t meta_data = 0;
+    for (unsigned i = 0; i < sizeof(pcols) / sizeof(pcols[0]); i++) {
+        const void *d = NULL;
+        uint32_t nn = 0;
+        if (etap_col(b, ETAP_SEC_PACKET_META, pcols[i].id, &t, &nn, &d, NULL, NULL) == ETAP_OK) {
+            meta_cols++;
+            meta_data = align8_u(meta_data);
+            meta_data += nn * pcols[i].width;
+        }
+    }
+    if (meta_cols)
+        sz += align8_u(8u + 16u * meta_cols + align8_u(meta_data));
+
+    if (np)
+        sz += align8_u(np * 32u);
+
+    /* Parse field columns (validity 8-aligned + native / varlen). */
+    uint32_t parse_cols = 0, parse_data = 0;
+    uint32_t pf[4] = { ETAP_FLD_IPV4_SRC, ETAP_FLD_IPV4_DST, ETAP_FLD_TCP_SPORT, ETAP_FLD_TCP_DPORT };
+    uint32_t pw[4] = { 4, 4, 2, 2 };
+    for (int i = 0; i < 4; i++) {
+        const void *d = NULL; uint32_t nn = 0;
+        if (etap_col(b, ETAP_SEC_PARSE_COLS, pf[i], &t, &nn, &d, NULL, NULL) == ETAP_OK) {
+            parse_cols++;
+            parse_data = align8_u(parse_data);
+            parse_data += align8_u((nn + 7u) / 8u);
+            parse_data += nn * pw[i];
+        }
+    }
+    const void *vd = NULL; const uint8_t *vv = NULL; const uint32_t *vo = NULL; uint32_t nn = 0;
+    if (etap_col(b, ETAP_SEC_PARSE_COLS, ETAP_FLD_TLS_SNI, &t, &nn, &vd, &vv, &vo) == ETAP_OK && vo) {
+        parse_cols++;
+        parse_data = align8_u(parse_data);
+        parse_data += align8_u((nn + 7u) / 8u);
+        parse_data += 4u * (nn + 1u) + vo[nn];
+    }
+    if (etap_col(b, ETAP_SEC_PARSE_COLS, ETAP_FLD_HTTP_HOST, &t, &nn, &vd, &vv, &vo) == ETAP_OK && vo) {
+        parse_cols++;
+        parse_data = align8_u(parse_data);
+        parse_data += align8_u((nn + 7u) / 8u);
+        parse_data += 4u * (nn + 1u) + vo[nn];
+    }
+    if (parse_cols)
+        sz += align8_u(8u + 16u * parse_cols + align8_u(parse_data));
+
+    if (nf)
+        sz += align8_u(nf * 48u);
+
+    uint32_t feats[5] = { ETAP_FEAT_PKTS_FWD, ETAP_FEAT_PKTS_REV, ETAP_FEAT_BYTES_FWD, ETAP_FEAT_BYTES_REV, ETAP_FEAT_DURATION };
+    uint32_t fc = 0, fd = 0;
+    for (int i = 0; i < 5; i++) {
+        const void *d = NULL; uint32_t nnn = 0;
+        if (etap_col(b, ETAP_SEC_FLOW_FEAT, feats[i], &t, &nnn, &d, NULL, NULL) == ETAP_OK) {
+            fc++;
+            fd = align8_u(fd);
+            fd += nnn * 8u;
+        }
+    }
+    if (fc)
+        sz += align8_u(8u + 16u * fc + align8_u(fd));
+
+    const uint32_t *fo = NULL; const void *fv = NULL;
+    if (etap_col(b, ETAP_SEC_FLOW_PKTS, 1, &t, &nn, &fv, NULL, &fo) == ETAP_OK && fo) {
+        sz += align8_u(8u + 16u + align8_u(4u * (nn + 1u) + fo[nn]));
+    }
+
+    /* SCHEMA section payload was 16 bytes plus padding. */
+    if (h->flags & ETAP_BF_SCHEMA_EMBEDDED)
+        sz += align8_u(16u);
+    return sz;
 }
 
 static int col_present(const etap_batch *b, uint16_t kind, uint32_t col)
@@ -191,19 +297,22 @@ int main(void)
     CHECK(etap_poll(sub, 0, &b) == ETAP_OK && b, "poll");
     const etap_batch_hdr *bh = etap_batch_header(b);
     CHECK(bh->magic == ETAP_MAGIC, "batch magic 0x%x", bh->magic);
-    CHECK(bh->hdr_len == 128, "hdr_len=%u", bh->hdr_len);
+    CHECK(bh->hdr_len == ETAP_BATCH_HDR_PREFIX_LEN, "无缺口时 hdr_len=%u 应为 92", bh->hdr_len);
     CHECK(bh->version == ETAP_VERSION, "version");
-    CHECK(sizeof(*bh) == 128, "sizeof header");
+    CHECK(sizeof(*bh) == 124, "decoded header 含 gap 字段，应为 124，得到 %zu", sizeof(*bh));
     uint32_t rawsz = 0;
     const uint8_t *raw = etap_batch_data(b, &rawsz);
-    CHECK(raw && rawsz == bh->total_size && rawsz >= 128, "total_size 与缓冲一致 %u/%u", rawsz, bh->total_size);
+    CHECK(raw && rawsz == bh->total_size && rawsz >= bh->hdr_len, "total_size 与缓冲一致 %u/%u", rawsz, bh->total_size);
     CHECK(bh->n_packets > 0 && bh->n_packets <= 8, "n_packets=%u", bh->n_packets);
     CHECK(bh->n_parse_rows == bh->n_packets, "解析行与报文对齐");
     CHECK(bh->n_flows > 0, "含流视图");
     CHECK(bh->seq == 0, "首批 seq=0");
     CHECK(bh->epoch == 1, "epoch=1");
     CHECK(bh->time_last_ns >= bh->time_first_ns, "时间窗有序");
-    CHECK(bh->sections_off + 24u * bh->n_sections <= bh->total_size, "节目录越界");
+    CHECK(bh->sections_off == bh->hdr_len, "节目录紧随批次头 sections_off=%u hdr_len=%u", bh->sections_off, bh->hdr_len);
+    CHECK(bh->sections_off + ETAP_SECTION_LEN * bh->n_sections <= bh->total_size, "节目录越界");
+    CHECK((bh->flags & ETAP_BF_HAS_GAP) == 0, "首批无缺口");
+    CHECK(bh->gap_dropped_pkts == 0 && bh->gap_dropped_bytes == 0, "解码头的 gap 字段应为 0");
     CHECK((bh->flags & ETAP_BF_SCHEMA_EMBEDDED) != 0, "首批应内嵌 schema");
     CHECK(section_present(b, ETAP_SEC_PACKET_META), "PACKET_META");
     CHECK(section_present(b, ETAP_SEC_PACKET_BYTES), "PACKET_BYTES");
@@ -531,11 +640,162 @@ int main(void)
         CHECK(etap_close(conn) == ETAP_OK, "close");
     }
 
+
+    CASE("PACKET_BYTES 紧密拼接，无每包 8 字节填充");
+    {
+        etap_conn *c4 = NULL;
+        etap_open("etap://sim", NULL, &c4);
+        etap_sub *s4 = NULL;
+        CHECK(etap_subscribe(c4, &req, &s4) == ETAP_OK, "subscribe");
+        etap_batch *b4 = NULL;
+        CHECK(etap_poll(s4, 0, &b4) == ETAP_OK && b4, "poll");
+        const etap_batch_hdr *h4 = etap_batch_header(b4);
+        etap_type t;
+        uint32_t n = 0;
+        const uint32_t *off = NULL, *len = NULL;
+        CHECK(etap_col(b4, ETAP_SEC_PACKET_META, ETAP_COL_BYTES_OFF, &t, &n, (const void **)&off, NULL, NULL) == ETAP_OK, "bytes_off");
+        CHECK(etap_col(b4, ETAP_SEC_PACKET_META, ETAP_COL_BYTES_LEN, &t, &n, (const void **)&len, NULL, NULL) == ETAP_OK, "bytes_len");
+        CHECK(n == h4->n_packets && n >= 2, "至少两包以便检查相邻偏移 n=%u", n);
+        for (uint32_t i = 0; i + 1 < n; i++) {
+            CHECK(off[i] + len[i] == off[i + 1],
+                  "切片应紧密相邻 @%u off=%u len=%u next=%u", i, off[i], len[i], off[i + 1]);
+        }
+        for (uint32_t i = 0; i < n; i++) {
+            etap_span sp = etap_packet_bytes(b4, i);
+            CHECK(sp.len == len[i], "etap_packet_bytes 长度与列一致 @%u", i);
+        }
+
+        CASE("值往返：pkt_id / ts_ns / wire_len / proto / 端口 / flow_id");
+        {
+            const uint64_t *ids = NULL, *fids = NULL, *ts = NULL;
+            const uint32_t *wire = NULL;
+            CHECK(etap_col(b4, ETAP_SEC_PACKET_META, ETAP_COL_PKT_ID, &t, &n, (const void **)&ids, NULL, NULL) == ETAP_OK, "pkt_id");
+            CHECK(etap_col(b4, ETAP_SEC_PACKET_META, ETAP_COL_FLOW_ID, &t, &n, (const void **)&fids, NULL, NULL) == ETAP_OK, "flow_id");
+            CHECK(etap_col(b4, ETAP_SEC_PACKET_META, ETAP_COL_TS_NS, &t, &n, (const void **)&ts, NULL, NULL) == ETAP_OK, "ts");
+            CHECK(etap_col(b4, ETAP_SEC_PACKET_META, ETAP_COL_WIRE_LEN, &t, &n, (const void **)&wire, NULL, NULL) == ETAP_OK, "wire");
+            /* Simulator logical clock: T0=1e12 ns, IAT=1 ms, pkt_id from 1. */
+            const uint64_t t0 = 1000000000000ull;
+            const uint64_t iat = 1000000ull;
+            CHECK(ids[0] == 1 && ts[0] == t0, "首包 pkt_id=1 ts=T0，得到 id=%llu ts=%llu",
+                  (unsigned long long)ids[0], (unsigned long long)ts[0]);
+            for (uint32_t i = 0; i < n; i++) {
+                CHECK(ids[i] == 1ull + i, "pkt_id 逻辑值 @%u", i);
+                CHECK(ts[i] == t0 + i * iat, "ts_ns 逻辑值 @%u", i);
+                CHECK(fids[i] != 0, "已归流 @%u", i);
+                CHECK(wire[i] >= 54, "wire_len 至少以太网头+IP+TCP @%u %u", i, wire[i]);
+            }
+            CHECK(h4->time_first_ns == ts[0] && h4->time_last_ns == ts[n - 1], "批次时间窗与列一致");
+            uint32_t nidx = 0;
+            const etap_parse_index_row *rows = etap_parse_index(b4, &nidx);
+            const uint16_t *sport = NULL, *dport = NULL;
+            CHECK(rows && nidx == n, "parse index 行数");
+            CHECK(etap_col(b4, ETAP_SEC_PARSE_COLS, ETAP_FLD_TCP_SPORT, &t, &n, (const void **)&sport, NULL, NULL) == ETAP_OK, "sport");
+            CHECK(etap_col(b4, ETAP_SEC_PARSE_COLS, ETAP_FLD_TCP_DPORT, &t, &n, (const void **)&dport, NULL, NULL) == ETAP_OK, "dport");
+            for (uint32_t i = 0; i < nidx; i++) {
+                CHECK(rows[i].pkt_id == ids[i], "parse pkt_id 往返 @%u", i);
+                CHECK(rows[i].proto_id == ETAP_PROTO_HTTP || rows[i].proto_id == ETAP_PROTO_TLS, "proto_id");
+                if (dport[i] == 80)
+                    CHECK(rows[i].proto_id == ETAP_PROTO_HTTP && sport[i] == 49152, "HTTP 流端口");
+                else if (dport[i] == 443)
+                    CHECK(rows[i].proto_id == ETAP_PROTO_TLS && (sport[i] == 49153 || sport[i] == 49154), "TLS 流端口");
+            }
+            uint32_t nf = 0;
+            const etap_flow_meta_row *fr = etap_flow_meta(b4, &nf);
+            CHECK(fr && nf == h4->n_flows && nf > 0, "flow meta");
+            for (uint32_t i = 0; i < nf; i++) {
+                int seen = 0;
+                for (uint32_t k = 0; k < n; k++)
+                    if (fids[k] == fr[i].flow_id) seen = 1;
+                CHECK(seen, "flow_id %llu 能在报文列中找到", (unsigned long long)fr[i].flow_id);
+            }
+        }
+
+        CASE("紧凑批次体积严格小于同等内容的 v0.1 布局");
+        {
+            uint32_t v01 = v01_equivalent_size(b4);
+            CHECK(h4->total_size < v01,
+                  "v0.2 total_size=%u 应小于 v0.1 等价 %u（打包不得是空操作）",
+                  h4->total_size, v01);
+            /* Also require packed pkt_id/ts to beat n*8, and no 8-byte packet padding. */
+            uint32_t pad_bytes = 0, tight_bytes = 0;
+            for (uint32_t i = 0; i < n; i++) {
+                tight_bytes += len[i];
+                pad_bytes += align8_u(len[i]);
+            }
+            CHECK(tight_bytes < pad_bytes || n == 0,
+                  "去掉每包 8 字节填充后字节堆应更小 tight=%u padded=%u", tight_bytes, pad_bytes);
+            /* Inspect raw pkt_id column payload: DELTA/FOR/CONST must be < n*8. */
+            etap_section meta;
+            int got_meta = 0;
+            for (uint16_t i = 0; i < h4->n_sections; i++) {
+                if (etap_batch_section(b4, i, &meta) == ETAP_OK && meta.kind == ETAP_SEC_PACKET_META) {
+                    got_meta = 1;
+                    break;
+                }
+            }
+            CHECK(got_meta, "PACKET_META 节");
+            const uint8_t *rawb = etap_batch_data(b4, NULL);
+            const uint8_t *base = rawb + meta.off;
+            uint16_t ncols = 0;
+            memcpy(&ncols, base, 2);
+            int saw_small = 0;
+            for (uint16_t i = 0; i < ncols; i++) {
+                etap_col_desc d;
+                memcpy(&d, base + 4 + 16u * i, 16);
+                if (d.col_id == ETAP_COL_PKT_ID || d.col_id == ETAP_COL_TS_NS) {
+                    CHECK(d.codec != ETAP_CODEC_RAW,
+                          "col %u 应对单调 u64 使用压缩编码，codec=%u", d.col_id, d.codec);
+                    CHECK(d.data_len < n * 8u,
+                          "col %u packed data_len=%u 应小于 n*8=%u", d.col_id, d.data_len, n * 8u);
+                    saw_small = 1;
+                }
+            }
+            CHECK(saw_small, "应检查到已压缩的 pkt_id/ts 列");
+            printf("    例：本批 total_size=%u，v0.1 等价=%u，n_packets=%u\n",
+                   h4->total_size, v01, h4->n_packets);
+        }
+
+        CASE("HAS_GAP 时头为 124 字节且含缺口块；无缺口时为 92 且不含该块");
+        {
+            CHECK(h4->hdr_len == 92 && h4->sections_off == 92, "无缺口 hdr_len/sections_off");
+            /* The bytes immediately after the 92-byte prefix are the section directory,
+             * not a 32-byte zero gap block written onto the wire. */
+            const uint8_t *rawb = etap_batch_data(b4, NULL);
+            etap_section s0;
+            CHECK(etap_batch_section(b4, 0, &s0) == ETAP_OK, "第一节");
+            CHECK(memcmp(rawb + 92, &s0, ETAP_SECTION_LEN) == 0,
+                  "偏移 92 处应为节目录而非 gap 块");
+            etap_release(b4);
+            b4 = NULL;
+            CHECK(etap_sim_drop(s4, 7, 700) == ETAP_OK, "注入缺口");
+            CHECK(etap_poll(s4, 0, &b4) == ETAP_OK && b4, "缺口后批次");
+            const etap_batch_hdr *hg = etap_batch_header(b4);
+            CHECK((hg->flags & ETAP_BF_HAS_GAP) != 0, "HAS_GAP");
+            CHECK(hg->hdr_len == 124 && hg->sections_off == 124, "有缺口时 hdr_len=124，得到 %u", hg->hdr_len);
+            CHECK(hg->gap_dropped_pkts == 7, "gap_dropped_pkts=%llu", (unsigned long long)hg->gap_dropped_pkts);
+            CHECK(hg->gap_dropped_bytes == 700, "gap_dropped_bytes");
+            CHECK(hg->gap_first_pkt_id != 0 && hg->gap_last_pkt_id >= hg->gap_first_pkt_id, "缺口区间");
+            uint32_t rawg = 0;
+            const uint8_t *rg = etap_batch_data(b4, &rawg);
+            uint64_t raw_gap_pkts = 0, raw_gap_bytes = 0;
+            memcpy(&raw_gap_pkts, rg + 92, 8);
+            memcpy(&raw_gap_bytes, rg + 100, 8);
+            CHECK(raw_gap_pkts == 7 && raw_gap_bytes == 700, "线上 gap 块出现在偏移 92 且非零");
+            etap_section sg;
+            CHECK(etap_batch_section(b4, 0, &sg) == ETAP_OK, "有缺口时节目录在 124");
+            CHECK(memcmp(rg + 124, &sg, ETAP_SECTION_LEN) == 0, "节目录紧随 124 字节头");
+            etap_release(b4);
+        }
+        etap_unsubscribe(s4);
+        etap_close(c4);
+    }
+
     CASE("头文件结构体大小");
     {
-        CHECK(sizeof(etap_batch_hdr) == 128, "batch hdr");
-        CHECK(sizeof(etap_section) == 24, "section");
-        CHECK(sizeof(etap_parse_index_row) == 32, "parse row");
+        CHECK(sizeof(etap_batch_hdr) == 124, "decoded batch hdr（含 gap 字段）");
+        CHECK(sizeof(etap_section) == 14, "packed section");
+        CHECK(sizeof(etap_col_desc) == 16, "col desc");
+        CHECK(sizeof(etap_parse_index_row) == 26, "parse row");
         CHECK(sizeof(etap_flow_meta_row) == 48, "flow row");
         CHECK(sizeof(etap_frame_hdr) == 16, "frame hdr");
     }

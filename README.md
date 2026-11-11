@@ -15,7 +15,7 @@ The near-term path is a lightweight adapter: freeze the language model, project 
 Language models normally ingest tokenized text. Dumping packet hex, logs, or JSON into a context window is low density and trains the model to read prose, not traffic. ETAP instead exposes a machine-facing port:
 
 - A low-frequency control plane to discover capabilities and to establish or adjust a subscription.
-- A high-throughput data plane that delivers **traffic observation batches** with a machine-readable schema.
+- A high-throughput data plane that delivers **traffic observation batches** with a machine-readable schema. Local memory, shared memory, and remote transport share one compact v0.2 layout: packed columns, a 92-byte header (124 with a gap block), and no 8-byte padding per packet or column.
 - Three correlated views — **packet**, **parse**, and **flow** — joined by unified IDs (`pkt_id`, `flow_id`, timestamps, and related identifiers).
 - Packet bytes in a contiguous buffer, parse results as typed columns, variable-length fields via offset/length, and validity bitmaps so “not observed” is not treated as “did not happen.”
 - Overflow is handled by sampling, aggregation, or dropping, with gap reports on the batch rather than by blocking the data plane.
@@ -42,7 +42,7 @@ Requires GCC with C11 and pthreads (verified with GCC 14 on Debian):
 ./build.sh && ./build/test_etap
 ```
 
-The suite checks discovery, subscription, 128-byte batch headers, alignment of the three views, on-demand column selection, gap and truncation flags, end-of-stream `EMPTY`, and schema/epoch changes after a destructive resubscribe.
+The suite checks discovery, subscription, the v0.2 compact batch layout (92-byte header, or 124 bytes when a gap block is present), alignment of the three views, on-demand column selection, gap and truncation flags, end-of-stream `EMPTY`, and schema/epoch changes after a destructive resubscribe.
 
 ## Encoder roadmap
 
