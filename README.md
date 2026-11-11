@@ -2,10 +2,6 @@
 
 **Ethernet Traffic Awareness Port** — an encoder that adapts live Ethernet traffic into model-ready views so large language models can consume network data without turning it into text.
 
-中文摘要：本仓库的目标是开发 ETAP 编码器，把网络实时流量接入并适配各类大模型。数据通路不把流量转换成 JSON、日志或自然语言；模型消费的是报文、解析、流三种高密度列式视图。
-
-完整中文愿景见 [README.zh-CN.md](README.zh-CN.md)。
-
 ## Vision
 
 Networks produce a continuous stream of binary traffic; language models natively consume tokenized text. The usual bridges — hex dumps, logs, JSON, or natural-language packet write-ups — are low density and lossy, and they train the model to read prose rather than traffic.
@@ -24,7 +20,7 @@ Language models normally ingest tokenized text. Dumping packet hex, logs, or JSO
 - Packet bytes in a contiguous buffer, parse results as typed columns, variable-length fields via offset/length, and validity bitmaps so “not observed” is not treated as “did not happen.”
 - Overflow is handled by sampling, aggregation, or dropping, with gap reports on the batch rather than by blocking the data plane.
 
-The interface specification (Chinese) is in [docs/ETAP-interface-spec.md](docs/ETAP-interface-spec.md).
+The interface specification is in [docs/ETAP-interface-spec.md](docs/ETAP-interface-spec.md).
 
 ## What’s in this repository
 
@@ -50,7 +46,7 @@ The suite checks discovery, subscription, 128-byte batch headers, alignment of t
 
 ## Encoder roadmap
 
-A first adapter lives in [`encoder/`](encoder/). It reads `etap://sim` batches as columnar tensors, encodes the packet / parse / flow views, and injects them into a frozen language model with `inputs_embeds`. Tests and the default training loop use a same-width FakeQwen stand-in (no 2B download). See [`encoder/README.md`](encoder/README.md) and the Chinese how-to [`encoder/docs/train-adapter-only.md`](encoder/docs/train-adapter-only.md) for “只训适配器就能先跑通”.
+A first adapter lives in [`encoder/`](encoder/). It reads `etap://sim` batches as columnar tensors, encodes the packet / parse / flow views, and injects them into a frozen language model with `inputs_embeds`. Tests and the default training loop use a same-width FakeQwen stand-in (no 2B download). See [`encoder/README.md`](encoder/README.md) and [`encoder/docs/train-adapter-only.md`](encoder/docs/train-adapter-only.md) for how to train the adapter only and get a first working run.
 
 1. Keep the ETAP C API as the source of live or simulated batches.
 2. (Done, minimal) An adapter that projects packet / parse / flow columns into tensors (numeric projection, categorical embeddings, a small byte encoder) and aligns them to a model hidden size (2048 for Qwen3.5-2B-Base).
