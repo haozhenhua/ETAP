@@ -1,0 +1,6 @@
+# CPU wheels. From the repo root:
+#   python3 -m venv encoder/.venv
+#   . encoder/.venv/bin/activate
+#   pip install -r encoder/requirements.txt --index-url https://download.pytorch.org/whl/cpu
+torch>=2.5
+numpy>=2.0

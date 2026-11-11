@@ -24,7 +24,7 @@ The interface specification (Chinese) is in [docs/ETAP-interface-spec.md](docs/E
 | `tests/test_etap.c` | Interface verification suite |
 | `build.sh` | Build the library and tests with system `gcc` (no `make`/`cmake` required) |
 | `docs/ETAP-interface-spec.md` | Interface specification |
-| `encoder/` | Placeholder for the model-side encoder / adapter |
+| `encoder/` | Minimal Qwen3.5 adapter (three-view encoder, FakeQwen training path) and [encoder/docs/train-adapter-only.md](encoder/docs/train-adapter-only.md) |
 
 The reference implementation includes an in-process simulator, `etap://sim`, so you can subscribe, poll batches, and run the tests without a NIC.
 
@@ -40,8 +40,10 @@ The suite checks discovery, subscription, 128-byte batch headers, alignment of t
 
 ## Encoder roadmap
 
+A first adapter lives in [`encoder/`](encoder/). It reads `etap://sim` batches as columnar tensors, encodes the packet / parse / flow views, and injects them into a frozen language model with `inputs_embeds`. Tests and the default training loop use a same-width FakeQwen stand-in (no 2B download). See [`encoder/README.md`](encoder/README.md) and the Chinese how-to [`encoder/docs/train-adapter-only.md`](encoder/docs/train-adapter-only.md) for “只训适配器就能先跑通”.
+
 1. Keep the ETAP C API as the source of live or simulated batches.
-2. Implement an adapter that projects packet / parse / flow columns into tensors (numeric projection, categorical embeddings, a small byte encoder) and aligns them to a model hidden size.
+2. (Done, minimal) An adapter that projects packet / parse / flow columns into tensors (numeric projection, categorical embeddings, a small byte encoder) and aligns them to a model hidden size (2048 for Qwen3.5-2B-Base).
 3. Train the adapter first with the language model frozen; optionally continue-pretrain or fine-tune the base model so it can read the packed representation.
 4. Optionally add a dedicated ETAP encoder, in the same spirit as a vision encoder, and attach it to various base models rather than changing their language core.
 

@@ -1,0 +1,212 @@
+"""Well-known ETAP identifiers mirrored from etap.h. Do not invent new IDs."""
+
+HIDDEN_SIZE = 2048
+PATCH_SIZE = 16
+ADAPTER_DIM = 128
+BYTE_DIM = 32
+MAX_PATCHES = 16  # up to 256 captured bytes per packet / varlen field
+PROTO_VOCAB = 16  # covers ETAP_PROTO_* (1..5); 0 is padding
+EVENT_VOCAB = 32  # covers ETAP_FLOW_EV_* values 1,2,4,8,16
+STATE_VOCAB = 256
+BYTE_VOCAB = 257  # 0..255 plus padding id 256
+BYTE_PAD = 256
+
+QWEN35_2B_BASE = "Qwen/Qwen3.5-2B-Base"
+QWEN35_2B_VOCAB = 248320
+QWEN35_2B_LAYERS = 24
+
+ETAP_VERSION = 0x0001
+ETAP_MAGIC = 0x31504154
+ETAP_BATCH_HDR_LEN = 128
+
+# etap_status
+ETAP_OK = 0
+ETAP_EMPTY = 1
+ETAP_TIMEOUT = 2
+ETAP_UNSUPPORTED = 3
+ETAP_INVALID = 4
+ETAP_REDUCED = 5
+ETAP_STALE_EPOCH = 6
+ETAP_NOMEM = 7
+ETAP_IO = 8
+ETAP_CLOSED = 9
+ETAP_SCHEMA = 10
+
+# etap_type
+ETAP_T_U8 = 1
+ETAP_T_U16 = 2
+ETAP_T_U32 = 3
+ETAP_T_U64 = 4
+ETAP_T_I8 = 5
+ETAP_T_I16 = 6
+ETAP_T_I32 = 7
+ETAP_T_I64 = 8
+ETAP_T_BOOL = 9
+ETAP_T_F32 = 10
+ETAP_T_F64 = 11
+ETAP_T_MAC = 12
+ETAP_T_IPV4 = 13
+ETAP_T_IPV6 = 14
+ETAP_T_ENUM = 15
+ETAP_T_BYTES = 16
+ETAP_T_TS_NS = 17
+ETAP_T_DUR_NS = 18
+
+ETAP_VIEW_PACKET = 1 << 0
+ETAP_VIEW_PARSE = 1 << 1
+ETAP_VIEW_FLOW = 1 << 2
+ETAP_VIEW_ALL = ETAP_VIEW_PACKET | ETAP_VIEW_PARSE | ETAP_VIEW_FLOW
+
+ETAP_BYTES_NONE = 0
+ETAP_BYTES_HEADERS = 1
+ETAP_BYTES_RANGES = 2
+ETAP_BYTES_PREFIX = 3
+ETAP_BYTES_CAP = 4
+
+# Packet meta col_id (etap.h)
+ETAP_COL_PKT_ID = 1
+ETAP_COL_FLOW_ID = 2
+ETAP_COL_TS_NS = 3
+ETAP_COL_WIRE_LEN = 4
+ETAP_COL_CAP_LEN = 5
+ETAP_COL_DIR = 6
+ETAP_COL_IFINDEX = 7
+ETAP_COL_FLAGS = 8
+ETAP_COL_L3_OFF = 9
+ETAP_COL_L4_OFF = 10
+ETAP_COL_BYTES_OFF = 11
+ETAP_COL_BYTES_LEN = 12
+ETAP_COL_BYTES = ETAP_COL_BYTES_OFF
+
+# Catalog IDs used by the reference implementation
+ETAP_PROTO_ETH = 1
+ETAP_PROTO_IPV4 = 2
+ETAP_PROTO_TCP = 3
+ETAP_PROTO_TLS = 4
+ETAP_PROTO_HTTP = 5
+
+ETAP_FLD_IPV4_SRC = 1
+ETAP_FLD_IPV4_DST = 2
+ETAP_FLD_TCP_SPORT = 3
+ETAP_FLD_TCP_DPORT = 4
+ETAP_FLD_TLS_SNI = 5
+ETAP_FLD_HTTP_HOST = 6
+
+ETAP_FEAT_PKTS_FWD = 1
+ETAP_FEAT_PKTS_REV = 2
+ETAP_FEAT_BYTES_FWD = 3
+ETAP_FEAT_BYTES_REV = 4
+ETAP_FEAT_DURATION = 5
+
+ETAP_META_PKT_ID = 1 << 0
+ETAP_META_FLOW_ID = 1 << 1
+ETAP_META_TS_NS = 1 << 2
+ETAP_META_WIRE_LEN = 1 << 3
+ETAP_META_CAP_LEN = 1 << 4
+ETAP_META_DIR = 1 << 5
+ETAP_META_IFINDEX = 1 << 6
+ETAP_META_FLAGS = 1 << 7
+ETAP_META_L3_OFF = 1 << 8
+ETAP_META_L4_OFF = 1 << 9
+ETAP_META_PAYLOAD = 1 << 10
+ETAP_META_ALL = 0x0FFF  # same mask as tests/test_etap.c build_full_req
+
+ETAP_FLOW_EV_NEW = 1 << 0
+ETAP_FLOW_EV_UPDATE = 1 << 1
+ETAP_FLOW_EV_EXPIRE = 1 << 2
+ETAP_FLOW_EV_RESET = 1 << 3
+ETAP_FLOW_EV_ANOMALY = 1 << 4
+
+ETAP_SEC_PACKET_META = 1
+ETAP_SEC_PACKET_BYTES = 2
+ETAP_SEC_PARSE_INDEX = 3
+ETAP_SEC_PARSE_COLS = 4
+ETAP_SEC_FLOW_META = 5
+ETAP_SEC_FLOW_FEAT = 6
+ETAP_SEC_FLOW_PKTS = 7
+ETAP_SEC_SCHEMA = 8
+ETAP_SEC_HEAP = 9
+ETAP_SEC_GAP = 10
+
+# View-type embedding ids (adapter-internal, not on-wire)
+VIEW_FLOW = 0
+VIEW_PACKET = 1
+VIEW_PARSE = 2
+
+TYPE_WIDTH = {
+    ETAP_T_U8: 1,
+    ETAP_T_U16: 2,
+    ETAP_T_U32: 4,
+    ETAP_T_U64: 8,
+    ETAP_T_I8: 1,
+    ETAP_T_I16: 2,
+    ETAP_T_I32: 4,
+    ETAP_T_I64: 8,
+    ETAP_T_BOOL: 1,
+    ETAP_T_F32: 4,
+    ETAP_T_F64: 8,
+    ETAP_T_MAC: 6,
+    ETAP_T_IPV4: 4,
+    ETAP_T_IPV6: 16,
+    ETAP_T_TS_NS: 8,
+    ETAP_T_DUR_NS: 8,
+}
+
+NUMPY_DTYPE = {
+    ETAP_T_U8: "u1",
+    ETAP_T_U16: "<u2",
+    ETAP_T_U32: "<u4",
+    ETAP_T_U64: "<u8",
+    ETAP_T_I8: "i1",
+    ETAP_T_I16: "<i2",
+    ETAP_T_I32: "<i4",
+    ETAP_T_I64: "<i8",
+    ETAP_T_BOOL: "u1",
+    ETAP_T_F32: "<f4",
+    ETAP_T_F64: "<f8",
+    ETAP_T_MAC: "u1",
+    ETAP_T_IPV4: "<u4",
+    ETAP_T_IPV6: "u1",
+    ETAP_T_TS_NS: "<u8",
+    ETAP_T_DUR_NS: "<u8",
+}
+
+PARSE_INDEX_DTYPE = [
+    ("pkt_id", "<u8"),
+    ("msg_id", "<u8"),
+    ("proto_id", "<u4"),
+    ("msg_off", "<u2"),
+    ("msg_len", "<u2"),
+    ("flags", "<u2"),
+    ("reserved", "<u2"),
+    ("reserved2", "<u4"),
+]
+
+FLOW_META_DTYPE = [
+    ("flow_id", "<u8"),
+    ("event", "u1"),
+    ("state", "u1"),
+    ("flags", "<u2"),
+    ("ifindex", "<u4"),
+    ("start_ns", "<u8"),
+    ("last_ns", "<u8"),
+    ("pkt_id_first", "<u8"),
+    ("pkt_id_last", "<u8"),
+]
+
+ALL_PARSE_FIELDS = (
+    ETAP_FLD_IPV4_SRC,
+    ETAP_FLD_IPV4_DST,
+    ETAP_FLD_TCP_SPORT,
+    ETAP_FLD_TCP_DPORT,
+    ETAP_FLD_TLS_SNI,
+    ETAP_FLD_HTTP_HOST,
+)
+
+ALL_FLOW_FEATS = (
+    ETAP_FEAT_PKTS_FWD,
+    ETAP_FEAT_PKTS_REV,
+    ETAP_FEAT_BYTES_FWD,
+    ETAP_FEAT_BYTES_REV,
+    ETAP_FEAT_DURATION,
+)

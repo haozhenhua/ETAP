@@ -4,3 +4,8 @@ build/
 *.so
 test_etap
 .DS_Store
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/

@@ -7,6 +7,9 @@ BUILD="$ROOT/build"
 mkdir -p "$BUILD"
 CFLAGS="-std=c11 -O2 -g -Wall -Wextra -pthread -I$ROOT"
 
-gcc $CFLAGS -c "$ROOT/src/etap.c" -o "$BUILD/etap.o"
+# -fPIC so the same object can be linked into libetap.so and the test binary.
+gcc $CFLAGS -fPIC -c "$ROOT/src/etap.c" -o "$BUILD/etap.o"
+gcc $CFLAGS -shared -fPIC "$BUILD/etap.o" -o "$BUILD/libetap.so"
 gcc $CFLAGS "$ROOT/tests/test_etap.c" "$BUILD/etap.o" -o "$BUILD/test_etap"
 echo "已生成 $BUILD/test_etap"
+echo "已生成 $BUILD/libetap.so"
