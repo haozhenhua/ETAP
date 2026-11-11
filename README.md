@@ -4,6 +4,16 @@
 
 中文摘要：本仓库的目标是开发 ETAP 编码器，把网络实时流量接入并适配各类大模型。数据通路不把流量转换成 JSON、日志或自然语言；模型消费的是报文、解析、流三种高密度列式视图。
 
+完整中文愿景见 [README.zh-CN.md](README.zh-CN.md)。
+
+## Vision
+
+Networks produce a continuous stream of binary traffic; language models natively consume tokenized text. The usual bridges — hex dumps, logs, JSON, or natural-language packet write-ups — are low density and lossy, and they train the model to read prose rather than traffic.
+
+This repository exists to close that gap. ETAP is a machine-facing port that exposes live Ethernet traffic as typed, high-density observation batches. An ETAP encoder then maps those batches into a model's representation space, in the same spirit as a vision encoder for images, so many base models can consume network data without a text conversion on the data path.
+
+The near-term path is a lightweight adapter: freeze the language model, project the packet / parse / flow views into its hidden size, and inject them with `inputs_embeds`. The longer-term aim is a dedicated ETAP encoder that can be attached to various base models without rewriting their language core.
+
 ## Why ETAP
 
 Language models normally ingest tokenized text. Dumping packet hex, logs, or JSON into a context window is low density and trains the model to read prose, not traffic. ETAP instead exposes a machine-facing port:
